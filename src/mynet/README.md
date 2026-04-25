@@ -345,6 +345,8 @@ outputs/mynet_infer/image_png/
 python -m src.mynet.annotate_video \
   --video data/raw/action4.mp4 \
   --output-root data/dji_action4_video_annot \
+  --start-sec 0 \
+  --end-sec 10 \
   --sample-every-sec 1.0 \
   --min-bboxes 1 \
   --max-bboxes 2 \
@@ -360,6 +362,8 @@ python -m src.mynet.annotate_video \
 - 框选后按 `c` 标注 8 个角点，按 `b` 只保存 bbox 给 YOLO，按 `s` 跳过。
 - 角点标注窗口中，左键点击当前角点，`i` 标为不可见，`u` 撤销，`r` 重标当前实例，`Enter` 完成当前实例。
 - 完成一帧后，按 `y` 保存 bbox + 角点，按 `b` 只保存 bbox，按 `q` 保存进度并退出。
+- 可用 `--start-sec` 和 `--end-sec` 只标注某个时间段，例如视频开头 `0-10s`。
+- 不带 `--overwrite` 时，新标注会用唯一 `record_id` 追加到已有 `annotations.json`、YOLO 数据和 MyNet 数据后面，不会覆盖旧标注；带 `--overwrite` 才会从头开始。
 
 输出结构：
 
@@ -406,4 +410,4 @@ python -m src.mynet.train \
   --amp
 ```
 
-脚本支持断点续标：重新运行同一条命令时会读取已有 `annotations.json` 并跳过已处理帧。若要从头开始，增加 `--overwrite`。
+脚本会读取已有 `annotations.json`。默认行为是追加新标注；若要从头开始，增加 `--overwrite`。

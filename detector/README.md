@@ -164,8 +164,33 @@ python detector/predict_yolo.py \
   --project detector/predictions \
   --name video_test \
   --imgsz 960 \
-  --conf 0.25
+  --conf 0.25 \
+  --max-detections 2
 ```
+
+如果要利用人工标注作为回退先验，传入标注脚本生成的 `annotations.json`：
+
+```bash
+python detector/predict_yolo.py \
+  --weights detector/runs/dji_action4_yolo/weights/best.pt \
+  --source data/raw/action4.mp4 \
+  --project detector/predictions \
+  --name video_test_with_fallback \
+  --imgsz 960 \
+  --conf 0.25 \
+  --max-detections 2 \
+  --annotations-json data/dji_action4_video_annot/annotations.json \
+  --fallback-to-annotations \
+  --save-txt \
+  --save-conf
+```
+
+该推理脚本会应用两个先验：
+
+- 每帧最多存在 2 个 DJI Action4；若模型输出超过 2 个达到置信度阈值的框，只保留置信度最高的 2 个。
+- 若某帧没有任何框达到 `--conf`，且该帧在 `annotations.json` 中标注过，则直接使用人工标注 bbox 作为该帧检测结果。
+
+输出目录中会包含叠框视频/图片、可选 YOLO txt label，以及 `predictions.json`。
 
 如果效果满意，可以保存最终权重：
 

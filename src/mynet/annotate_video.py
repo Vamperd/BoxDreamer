@@ -43,6 +43,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--video", type=Path, required=True)
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--sample-every-sec", type=float, default=1.0)
+    parser.add_argument("--start-sec", type=float, default=0.0, help="Start annotation from this timestamp in seconds.")
+    parser.add_argument("--end-sec", type=float, default=None, help="Stop annotation before this timestamp in seconds.")
     parser.add_argument("--min-bboxes", type=int, default=1)
     parser.add_argument("--max-bboxes", type=int, default=2)
     parser.add_argument("--crop-size", type=int, default=256)
@@ -68,6 +70,10 @@ def load_cv2() -> Any:
 def ensure_args(args: argparse.Namespace) -> None:
     if args.sample_every_sec <= 0:
         raise ValueError("--sample-every-sec must be positive.")
+    if args.start_sec < 0:
+        raise ValueError("--start-sec must be >= 0.")
+    if args.end_sec is not None and args.end_sec <= args.start_sec:
+        raise ValueError("--end-sec must be greater than --start-sec.")
     if args.min_bboxes < 0 or args.max_bboxes < args.min_bboxes:
         raise ValueError("Invalid --min-bboxes/--max-bboxes.")
     if args.train_ratio <= 0 or args.val_ratio < 0 or args.train_ratio + args.val_ratio >= 1:
@@ -303,9 +309,18 @@ def get_video_info(cv2: Any, video_path: Path) -> tuple[float, int, int, int]:
     return fps, frame_count, width, height
 
 
-def sampled_frame_indices(fps: float, frame_count: int, sample_every_sec: float, max_frames: Optional[int]) -> List[int]:
+def sampled_frame_indices(
+    fps: float,
+    frame_count: int,
+    sample_every_sec: float,
+    max_frames: Optional[int],
+    start_sec: float = 0.0,
+    end_sec: Optional[float] = None,
+) -> List[int]:
     step = max(1, int(round(fps * sample_every_sec)))
-    indices = list(range(0, frame_count, step))
+    start_frame = max(0, int(round(start_sec * fps)))
+    end_frame = frame_count if end_sec is None else min(frame_count, max(start_frame + 1, int(np.ceil(end_sec * fps))))
+    indices = list(range(start_frame, end_frame, step))
     if max_frames is not None:
         indices = indices[:max_frames]
     return indices
@@ -353,6 +368,19 @@ def upsert_frame_record(data: Dict[str, Any], record: Dict[str, Any]) -> None:
     frames.append(record)
     frames.sort(key=lambda item: int(item["frame_idx"]))
     data["frames"] = frames
+
+
+def append_frame_record(data: Dict[str, Any], record: Dict[str, Any], overwrite: bool) -> None:
+    if overwrite:
+        upsert_frame_record(data, record)
+        return
+    frames = list(data.get("frames", []))
+    frames.append(record)
+    data["frames"] = frames
+
+
+def next_record_id(data: Dict[str, Any], frame_idx: int) -> str:
+    return f"frame_{frame_idx:06d}_ann_{len(data.get('frames', [])):06d}"
 
 
 def make_square_crop_box(box: BBox, padding_ratio: float) -> BBox:
@@ -503,7 +531,8 @@ def export_mynet(data: Dict[str, Any], output_root: Path, args: argparse.Namespa
             corners_crop = full_to_crop(corners_full, crop_box, args.crop_size)
             heatmaps, effective_valid = make_heatmaps(corners_crop, corner_valid, args.crop_size, args.heatmap_size, args.sigma)
 
-            sample_id = f"frame_{int(frame['frame_idx']):06d}_{inst_idx:06d}"
+            record_id = str(frame.get("record_id") or Path(frame["image_path"]).stem)
+            sample_id = f"{record_id}_{inst_idx:06d}"
             crop_rel = Path("crops") / split / f"{sample_id}.png"
             heatmap_rel = Path("heatmaps") / split / f"{sample_id}.npy"
             debug_rel = Path("debug_vis") / split / f"{sample_id}.jpg"
@@ -606,6 +635,7 @@ def make_frame_record(
     instances: Sequence[Dict[str, Any]],
 ) -> Dict[str, Any]:
     return {
+        "record_id": frame_path.stem,
         "frame_idx": int(frame_idx),
         "timestamp_sec": round(float(timestamp_sec), 4),
         "image_path": relpath(frame_path, output_root),
@@ -619,9 +649,8 @@ def annotate_video(args: argparse.Namespace) -> None:
     ensure_args(args)
     cv2 = load_cv2()
     fps, frame_count, width, height = get_video_info(cv2, args.video)
-    frame_indices = sampled_frame_indices(fps, frame_count, args.sample_every_sec, args.max_frames)
+    frame_indices = sampled_frame_indices(fps, frame_count, args.sample_every_sec, args.max_frames, args.start_sec, args.end_sec)
     data = init_annotations(args, frame_size=[width, height])
-    annotated_ids = {int(item["frame_idx"]) for item in data.get("frames", [])}
 
     args.output_root.mkdir(parents=True, exist_ok=True)
     (args.output_root / "frames" / "all").mkdir(parents=True, exist_ok=True)
@@ -629,15 +658,14 @@ def annotate_video(args: argparse.Namespace) -> None:
 
     print(f"Video: {args.video}")
     print(f"FPS={fps:.3f}, frames={frame_count}, sampled candidates={len(frame_indices)}, size={width}x{height}")
-    print("Existing annotated/skipped frames will be skipped unless --overwrite is used.")
+    print(f"Annotation time range: {args.start_sec:.3f}s to {args.end_sec if args.end_sec is not None else 'video_end'}s")
+    print("Without --overwrite, new records are appended with unique names and existing annotations are preserved.")
 
     for position, frame_idx in enumerate(frame_indices):
-        if frame_idx in annotated_ids and not args.overwrite:
-            continue
-
         split = split_for_position(position, len(frame_indices), args.train_ratio, args.val_ratio)
         frame = extract_frame(cv2, args.video, frame_idx)
-        frame_path = args.output_root / "frames" / "all" / f"frame_{frame_idx:06d}.png"
+        record_id = next_record_id(data, frame_idx)
+        frame_path = args.output_root / "frames" / "all" / f"{record_id}.png"
         cv2.imwrite(str(frame_path), frame)
         timestamp_sec = frame_idx / fps
 
@@ -650,7 +678,7 @@ def annotate_video(args: argparse.Namespace) -> None:
                 return
             if not bboxes:
                 record = make_frame_record(args.output_root, frame_idx, timestamp_sec, frame_path, split, "skipped", [])
-                upsert_frame_record(data, record)
+                append_frame_record(data, record, args.overwrite)
                 save_json(args.output_root / "annotations.json", data)
                 print(f"Skipped frame {frame_idx}.")
                 break
@@ -681,7 +709,7 @@ def annotate_video(args: argparse.Namespace) -> None:
             return
         if action == "s":
             record = make_frame_record(args.output_root, frame_idx, timestamp_sec, frame_path, split, "skipped", [])
-            upsert_frame_record(data, record)
+            append_frame_record(data, record, args.overwrite)
             save_json(args.output_root / "annotations.json", data)
             print(f"Skipped frame {frame_idx}.")
             continue
@@ -699,7 +727,7 @@ def annotate_video(args: argparse.Namespace) -> None:
                     return
                 if result == "skip":
                     record = make_frame_record(args.output_root, frame_idx, timestamp_sec, frame_path, split, "skipped", [])
-                    upsert_frame_record(data, record)
+                    append_frame_record(data, record, args.overwrite)
                     save_json(args.output_root / "annotations.json", data)
                     print(f"Skipped frame {frame_idx}.")
                     break
@@ -729,7 +757,7 @@ def annotate_video(args: argparse.Namespace) -> None:
                     return
                 if final_action == "s":
                     record = make_frame_record(args.output_root, frame_idx, timestamp_sec, frame_path, split, "skipped", [])
-                    upsert_frame_record(data, record)
+                    append_frame_record(data, record, args.overwrite)
                     save_json(args.output_root / "annotations.json", data)
                     print(f"Skipped frame {frame_idx}.")
                     continue
@@ -742,10 +770,9 @@ def annotate_video(args: argparse.Namespace) -> None:
                 continue
 
         record = make_frame_record(args.output_root, frame_idx, timestamp_sec, frame_path, split, status, instances)
-        upsert_frame_record(data, record)
+        append_frame_record(data, record, args.overwrite)
         save_json(args.output_root / "annotations.json", data)
         export_all(data, args.output_root, args)
-        annotated_ids.add(frame_idx)
         print(f"Saved frame {frame_idx} as {status}; split={split}; instances={len(instances)}")
 
     save_json(args.output_root / "annotations.json", data)
