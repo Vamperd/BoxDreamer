@@ -27,7 +27,7 @@ RTX4090 推荐使用 CUDA 版 PyTorch。以下 CUDA 12.1 wheel 通常适合 4090
 
 ```bash
 uv pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
-uv pip install numpy pillow tqdm tensorboard
+uv pip install numpy pillow tqdm tensorboard opencv-python
 ```
 
 验证 GPU 与 CUDA：
@@ -44,7 +44,7 @@ PY
 如果只做 CPU 调试：
 
 ```bash
-uv pip install torch torchvision torchaudio numpy pillow tqdm tensorboard
+uv pip install torch torchvision torchaudio numpy pillow tqdm tensorboard opencv-python
 ```
 
 ## 2. 数据准备
@@ -231,3 +231,108 @@ RGB crop [B, 3, 256, 256]
 - OOM 时先把 `--batch-size 64` 降到 `32`，再降到 `16`。
 - `val/corner_px` 长期不降时，优先检查 bbox 是否包住完整物体、角点投影是否在 crop 内、heatmap 是否与 crop 对齐。
 - `train/loss` 下降但 `val/loss` 上升时，说明可能过拟合，应增加真实视频风格数据、遮挡/曝光增强，或减小训练轮数。
+
+## 10. 使用真实 image.png 检测效果
+
+MyNet 是 ROI 角点网络，不是整图 detector。因此真实图片推理需要先得到每个 DJI Action4 的 bbox，再把每个 bbox 对应的 ROI 输入网络。当前推理脚本默认支持 1 个或 2 个 bbox。
+
+### 10.1 手动框选 bbox
+
+在有图形界面的机器上，可以直接打开图片手动框选：
+
+```bash
+python -m src.mynet.select_bboxes \
+  --image image.png \
+  --output outputs/mynet_infer/image_png/bboxes.json \
+  --preview outputs/mynet_infer/image_png/bboxes_preview.png \
+  --min-bboxes 1 \
+  --max-bboxes 2
+```
+
+操作方式：
+
+- 鼠标拖动框住第一个 DJI Action4。
+- 按 `Enter` 或 `Space` 确认当前框。
+- 如果有第二个 DJI Action4，继续拖动第二个框并确认。
+- 框选完成后按 `Esc` 结束。
+
+输出的 `bboxes.json` 格式为：
+
+```json
+{
+  "image": "image.png",
+  "format": "xyxy_full_image_pixels",
+  "bboxes": [
+    [120.0, 80.0, 420.0, 360.0],
+    [520.0, 90.0, 810.0, 350.0]
+  ]
+}
+```
+
+如果远程 Ubuntu 没有图形界面，可以在本地桌面机器上运行该脚本生成 `bboxes.json`，再把 JSON 放到训练机推理。
+
+### 10.2 使用 bbox 推理
+
+使用刚刚手动框选得到的 bbox：
+
+```bash
+python -m src.mynet.infer_image \
+  --image image.png \
+  --checkpoint models/checkpoints/mynet_resnet34/best.pt \
+  --output-dir outputs/mynet_infer/image_png \
+  --bbox-json outputs/mynet_infer/image_png/bboxes.json \
+  --device cuda
+```
+
+也可以直接在命令行传入 1 个 bbox：
+
+```bash
+python -m src.mynet.infer_image \
+  --image image.png \
+  --checkpoint models/checkpoints/mynet_resnet34/best.pt \
+  --output-dir outputs/mynet_infer/image_png \
+  --bbox 120,80,420,360 \
+  --device cuda
+```
+
+或者传入 2 个 bbox，格式为 `x1,y1,x2,y2`，单位是原图像素：
+
+```bash
+python -m src.mynet.infer_image \
+  --image image.png \
+  --checkpoint models/checkpoints/mynet_resnet34/best.pt \
+  --output-dir outputs/mynet_infer/image_png \
+  --bbox 120,80,420,360 \
+  --bbox 520,90,810,350 \
+  --bbox-padding 0.25 \
+  --device cuda
+```
+
+输出文件：
+
+```text
+outputs/mynet_infer/image_png/
+  prediction_overlay.png
+  predictions.json
+  roi_00.png
+  roi_01.png
+```
+
+查看重点：
+
+- `prediction_overlay.png`：原图上叠加 bbox、正方形 crop 框、8 个预测角点和连线。
+- `predictions.json`：保存每个实例的 `corners_2d_full`，也就是回到原图坐标系的 8 个角点。
+- `roi_*.png`：实际送入网络的 ROI，可检查 bbox 和 padding 是否合理。
+
+如果 bbox 来自 detector，也可以写成相同 JSON：
+
+```json
+{
+  "bboxes": [
+    [120, 80, 420, 360],
+    [520, 90, 810, 350]
+  ]
+}
+```
+
+如果没有真实标注角点，此测试只能做可视化判断；如果要定量评估，需要另外标注 `image.png` 中两个目标的 8 个 2D 角点，再计算平均角点误差和 PCK。
