@@ -1,0 +1,13 @@
+runs/
+predictions/
+weights/*
+!weights/.gitkeep
+*.pt
+*.pth
+*.onnx
+*.engine
+*.torchscript
+*.tflite
+*.mlpackage
+*.ncnn
+*.openvino

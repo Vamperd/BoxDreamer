@@ -336,3 +336,74 @@ outputs/mynet_infer/image_png/
 ```
 
 如果没有真实标注角点，此测试只能做可视化判断；如果要定量评估，需要另外标注 `image.png` 中两个目标的 8 个 2D 角点，再计算平均角点误差和 PCK。
+
+## 11. 标注真实视频帧并导出训练数据
+
+如果需要用一个真实视频同时制作 YOLO detector 数据和 MyNet 微调数据，使用：
+
+```bash
+python -m src.mynet.annotate_video \
+  --video data/raw/action4.mp4 \
+  --output-root data/dji_action4_video_annot \
+  --sample-every-sec 1.0 \
+  --min-bboxes 1 \
+  --max-bboxes 2 \
+  --crop-size 256 \
+  --heatmap-size 64 \
+  --sigma 2.0 \
+  --bbox-padding 0.25
+```
+
+每个候选帧的流程：
+
+- 先用鼠标框选 1-2 个 DJI Action4 bbox。
+- 框选后按 `c` 标注 8 个角点，按 `b` 只保存 bbox 给 YOLO，按 `s` 跳过。
+- 角点标注窗口中，左键点击当前角点，`i` 标为不可见，`u` 撤销，`r` 重标当前实例，`Enter` 完成当前实例。
+- 完成一帧后，按 `y` 保存 bbox + 角点，按 `b` 只保存 bbox，按 `q` 保存进度并退出。
+
+输出结构：
+
+```text
+data/dji_action4_video_annot/
+  annotations.json
+  frames/all/*.png
+  previews/*.jpg
+  yolo/
+    data.yaml
+    images/{train,val,test}/*.png
+    labels/{train,val,test}/*.txt
+  mynet/
+    meta.json
+    train.json
+    val.json
+    test.json
+    crops/{train,val,test}/*.png
+    heatmaps/{train,val,test}/*.npy
+    debug_vis/{train,val,test}/*.jpg
+```
+
+训练 YOLO detector：
+
+```bash
+yolo detect train \
+  data=data/dji_action4_video_annot/yolo/data.yaml \
+  model=yolo11n.pt \
+  imgsz=960 \
+  epochs=100
+```
+
+微调 MyNet：
+
+```bash
+python -m src.mynet.train \
+  --data-root data/dji_action4_video_annot/mynet \
+  --train-index data/dji_action4_video_annot/mynet/train.json \
+  --val-index data/dji_action4_video_annot/mynet/val.json \
+  --output-dir models/checkpoints/mynet_video_ft \
+  --epochs 80 \
+  --batch-size 32 \
+  --lr 3e-5 \
+  --amp
+```
+
+脚本支持断点续标：重新运行同一条命令时会读取已有 `annotations.json` 并跳过已处理帧。若要从头开始，增加 `--overwrite`。
