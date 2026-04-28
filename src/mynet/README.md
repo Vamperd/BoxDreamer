@@ -411,3 +411,100 @@ python -m src.mynet.train \
 ```
 
 脚本会读取已有 `annotations.json`。默认行为是追加新标注；若要从头开始，增加 `--overwrite`。
+
+## 12. 视频端到端推理：Detector + MyNet
+
+如果已经训练好 YOLO detector 和 MyNet，可以直接对视频做完整推理：
+
+```bash
+python -m src.mynet.predict_video \
+  --video data/raw/action4.mp4 \
+  --detector-weights detector/runs/dji_action4_yolo/weights/best.pt \
+  --mynet-checkpoint models/checkpoints/mynet_video_ft/best.pt \
+  --output-dir outputs/video_mynet_pipeline \
+  --name action4_result \
+  --detector-device 0 \
+  --mynet-device cuda \
+  --imgsz 960 \
+  --conf 0.25 \
+  --iou 0.7 \
+  --max-detections 2 \
+  --bbox-padding 0.25 \
+  --crop-size 256
+```
+
+输出：
+
+```text
+outputs/video_mynet_pipeline/action4_result/
+  action4_result.mp4
+  predictions.jsonl
+  summary.json
+```
+
+流程为：
+
+```text
+video frame
+-> YOLO detector bbox
+-> top-2 bbox
+-> MyNet ROI corner heatmap
+-> 8 corners mapped back to full frame
+-> output video
+```
+
+如果 detector 在某帧没有达到置信度的检测，但该帧在人工标注中存在 bbox，可以启用 fallback：
+
+```bash
+python -m src.mynet.predict_video \
+  --video data/raw/action4.mp4 \
+  --detector-weights detector/runs/dji_action4_yolo/weights/best.pt \
+  --mynet-checkpoint models/checkpoints/mynet_video_ft/best.pt \
+  --annotations-json data/dji_action4_video_annot/annotations.json \
+  --fallback-to-annotations \
+  --output-dir outputs/video_mynet_pipeline \
+  --name action4_result_fallback
+```
+
+启用 debug 会保存中间图：
+
+```bash
+python -m src.mynet.predict_video \
+  --video data/raw/action4.mp4 \
+  --detector-weights detector/runs/dji_action4_yolo/weights/best.pt \
+  --mynet-checkpoint models/checkpoints/mynet_video_ft/best.pt \
+  --output-dir outputs/video_mynet_pipeline \
+  --name action4_debug \
+  --debug \
+  --debug-every 1
+```
+
+debug 输出：
+
+```text
+outputs/video_mynet_pipeline/action4_debug/debug/
+  detector_bbox_frames/frame_000000.jpg
+  roi_inputs/frame_000000_obj_00.jpg
+  roi_corners/frame_000000_obj_00.jpg
+  final_frames/frame_000000.jpg
+```
+
+含义：
+
+- `detector_bbox_frames`：detector 或人工 fallback 输出给 MyNet 的 bbox。
+- `roi_inputs`：实际输入 MyNet 的 ROI crop。
+- `roi_corners`：MyNet 在 ROI crop 上的 8 角点结果。
+- `final_frames`：角点映射回原视频帧后的最终帧。
+
+短视频或调试时可限制帧数：
+
+```bash
+python -m src.mynet.predict_video \
+  --video data/raw/action4.mp4 \
+  --detector-weights detector/runs/dji_action4_yolo/weights/best.pt \
+  --mynet-checkpoint models/checkpoints/mynet_video_ft/best.pt \
+  --output-dir outputs/video_mynet_pipeline \
+  --name smoke \
+  --max-frames 5 \
+  --debug
+```

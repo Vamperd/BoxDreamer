@@ -200,3 +200,34 @@ cp detector/runs/dji_action4_yolo/weights/best.pt detector/weights/dji_action4_y
 ```
 
 后续整图流程建议为：YOLO detector 先输出 1-2 个 DJI Action4 bbox，再把每个 bbox 送入 MyNet 做 8 角点预测。
+
+## 6. 接入 MyNet 输出角点视频
+
+训练好 detector 和 MyNet 后，可以使用端到端视频流水线：
+
+```bash
+python -m src.mynet.predict_video \
+  --video data/raw/action4.mp4 \
+  --detector-weights detector/runs/dji_action4_yolo/weights/best.pt \
+  --mynet-checkpoint models/checkpoints/mynet_video_ft/best.pt \
+  --output-dir outputs/video_mynet_pipeline \
+  --name action4_result \
+  --detector-device 0 \
+  --mynet-device cuda \
+  --imgsz 960 \
+  --conf 0.25 \
+  --max-detections 2
+```
+
+如需保存 detector bbox、ROI crop、ROI 角点和最终帧：
+
+```bash
+python -m src.mynet.predict_video \
+  --video data/raw/action4.mp4 \
+  --detector-weights detector/runs/dji_action4_yolo/weights/best.pt \
+  --mynet-checkpoint models/checkpoints/mynet_video_ft/best.pt \
+  --output-dir outputs/video_mynet_pipeline \
+  --name action4_debug \
+  --debug \
+  --debug-every 1
+```
