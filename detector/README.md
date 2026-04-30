@@ -216,8 +216,12 @@ python -m src.mynet.predict_video \
   --mynet-device cuda \
   --imgsz 960 \
   --conf 0.25 \
-  --max-detections 2
+  --max-detections 2 \
+  --decode-method subpixel \
+  --subpixel-window 5
 ```
+
+`subpixel` 是当前默认角点解码方式，可在不重新训练 MyNet 的情况下减少 hard argmax 的量化误差；如果效果变差，可改为 `--decode-method argmax` 对比。
 
 如需保存 detector bbox、ROI crop、ROI 角点和最终帧：
 

@@ -156,6 +156,27 @@ TensorBoard 中主要看这些曲线：
 
 判断训练是否有效时，优先看 `val/corner_px` 是否下降、`val/pck_5` 和 `val/pck_10` 是否上升。只看训练 loss 容易误判过拟合。
 
+### 5.1 只改解码进行 PCK2 对比
+
+当前推理和评估默认使用 `subpixel` 解码，可在不重新训练的情况下先验证是否改善 PCK2：
+
+```bash
+python -m src.mynet.evaluate \
+  --data-root data/dji_action4_video_annot/mynet \
+  --val-index data/dji_action4_video_annot/mynet/val.json \
+  --checkpoint models/checkpoints/mynet_video_ft/best.pt \
+  --decode-method argmax
+
+python -m src.mynet.evaluate \
+  --data-root data/dji_action4_video_annot/mynet \
+  --val-index data/dji_action4_video_annot/mynet/val.json \
+  --checkpoint models/checkpoints/mynet_video_ft/best.pt \
+  --decode-method subpixel \
+  --subpixel-window 5
+```
+
+如果 `subpixel` 被错误响应拖偏，可在评估、单图推理和视频推理中改回 `--decode-method argmax`。
+
 ## 6. 非 TensorBoard 方式
 
 每个 epoch 的指标也会写入：
@@ -412,6 +433,27 @@ python -m src.mynet.train \
 
 脚本会读取已有 `annotations.json`。默认行为是追加新标注；若要从头开始，增加 `--overwrite`。
 
+如果前期已经只标了 bbox，现在希望直接基于这些 bbox 补 8 个角点，不需要重新从视频框选 bbox，可运行：
+
+```bash
+python -m src.mynet.annotate_bbox_corners \
+  --output-root data/dji_action4_video_annot \
+  --crop-size 256 \
+  --heatmap-size 64 \
+  --sigma 2.0 \
+  --bbox-padding 0.25
+```
+
+该脚本会读取已有 `annotations.json` 中的 `bbox_only` 记录，在 ROI crop 上标角点，并把原记录升级为 `full`。常用筛选：
+
+```bash
+python -m src.mynet.annotate_bbox_corners \
+  --output-root data/dji_action4_video_annot \
+  --start-sec 0 \
+  --end-sec 10 \
+  --max-records 30
+```
+
 ## 12. 视频端到端推理：Detector + MyNet
 
 如果已经训练好 YOLO detector 和 MyNet，可以直接对视频做完整推理：
@@ -430,7 +472,9 @@ python -m src.mynet.predict_video \
   --iou 0.7 \
   --max-detections 2 \
   --bbox-padding 0.25 \
-  --crop-size 256
+  --crop-size 256 \
+  --decode-method subpixel \
+  --subpixel-window 5
 ```
 
 输出：

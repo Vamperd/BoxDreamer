@@ -27,6 +27,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--crop-size", type=int, default=256)
+    parser.add_argument("--decode-method", choices=["argmax", "subpixel"], default="subpixel")
+    parser.add_argument("--subpixel-window", type=int, default=5)
     parser.add_argument("--pretrained", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
@@ -123,7 +125,14 @@ def evaluate(model: nn.Module, loader: Optional[DataLoader], device: torch.devic
         batch = move_to_device(batch, device)
         logits = model(batch["image"])
         loss = masked_heatmap_mse(logits, batch["heatmap"], batch["corner_valid"])
-        metrics = corner_metrics(logits, batch["corners_2d_crop"], batch["corner_valid"], crop_size=args.crop_size)
+        metrics = corner_metrics(
+            logits,
+            batch["corners_2d_crop"],
+            batch["corner_valid"],
+            crop_size=args.crop_size,
+            decode_method=args.decode_method,
+            subpixel_window=args.subpixel_window,
+        )
         metrics["loss"] = float(loss.item())
         records.append(metrics)
     return aggregate(records)

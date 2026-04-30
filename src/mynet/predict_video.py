@@ -9,7 +9,7 @@ import numpy as np
 import torch
 from PIL import Image, ImageDraw
 
-from src.mynet.decode import decode_heatmap_argmax
+from src.mynet.decode import decode_heatmap
 from src.mynet.infer_image import crop_to_full, crop_with_padding, load_model, make_square_crop_box, preprocess
 
 
@@ -46,6 +46,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-detections", type=int, default=2)
     parser.add_argument("--bbox-padding", type=float, default=0.25)
     parser.add_argument("--crop-size", type=int, default=256)
+    parser.add_argument("--decode-method", choices=["argmax", "subpixel"], default="subpixel")
+    parser.add_argument("--subpixel-window", type=int, default=5)
     parser.add_argument("--annotations-json", type=Path, default=None)
     parser.add_argument("--fallback-to-annotations", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=True)
@@ -185,7 +187,12 @@ def run_mynet_on_detections(
     with torch.no_grad(), torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
         logits = mynet(batch)
 
-    corners_crop_batch = decode_heatmap_argmax(logits, crop_size=args.crop_size).detach().cpu().numpy()
+    corners_crop_batch = decode_heatmap(
+        logits,
+        crop_size=args.crop_size,
+        decode_method=args.decode_method,
+        subpixel_window=args.subpixel_window,
+    ).detach().cpu().numpy()
     heatmaps_batch = torch.sigmoid(logits).detach().cpu().numpy().astype(np.float32)
     scores_batch = heatmaps_batch.reshape(heatmaps_batch.shape[0], heatmaps_batch.shape[1], -1).max(axis=2)
 

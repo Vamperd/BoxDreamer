@@ -10,8 +10,7 @@ import torch
 from PIL import Image, ImageDraw
 
 from src.mynet.dataset import IMAGENET_MEAN, IMAGENET_STD
-from src.mynet.decode import decode_heatmap_argmax
-from src.mynet.model import CornerResNet34
+from src.mynet.decode import decode_heatmap
 
 
 BBox = Tuple[float, float, float, float]
@@ -46,6 +45,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-bboxes", type=int, default=2, help="Maximum number of bboxes to run.")
     parser.add_argument("--bbox-padding", type=float, default=0.25, help="Padding ratio applied before square ROI crop.")
     parser.add_argument("--crop-size", type=int, default=256)
+    parser.add_argument("--decode-method", choices=["argmax", "subpixel"], default="subpixel")
+    parser.add_argument("--subpixel-window", type=int, default=5)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--save-crops", action=argparse.BooleanOptionalAction, default=True)
     return parser.parse_args()
@@ -125,7 +126,9 @@ def preprocess(crop: Image.Image) -> torch.Tensor:
     return image.unsqueeze(0)
 
 
-def load_model(checkpoint_path: Path, device: torch.device) -> CornerResNet34:
+def load_model(checkpoint_path: Path, device: torch.device) -> torch.nn.Module:
+    from src.mynet.model import CornerResNet34
+
     checkpoint = torch.load(checkpoint_path, map_location=device)
     state_dict = checkpoint["model"] if isinstance(checkpoint, dict) and "model" in checkpoint else checkpoint
     model = CornerResNet34(out_channels=8, pretrained=False)
@@ -169,7 +172,12 @@ def main() -> None:
         tensor = preprocess(crop).to(device)
 
         logits = model(tensor)
-        corners_crop = decode_heatmap_argmax(logits, crop_size=args.crop_size)[0].cpu().numpy()
+        corners_crop = decode_heatmap(
+            logits,
+            crop_size=args.crop_size,
+            decode_method=args.decode_method,
+            subpixel_window=args.subpixel_window,
+        )[0].cpu().numpy()
         probs = torch.sigmoid(logits).flatten(2)
         scores = probs.max(dim=2).values[0].cpu().numpy().astype(float)
         corners_full = crop_to_full(corners_crop, crop_box, args.crop_size)
@@ -197,6 +205,8 @@ def main() -> None:
                 "checkpoint": str(args.checkpoint),
                 "bbox_padding": args.bbox_padding,
                 "crop_size": args.crop_size,
+                "decode_method": args.decode_method,
+                "subpixel_window": args.subpixel_window,
                 "predictions": predictions,
             },
             f,
