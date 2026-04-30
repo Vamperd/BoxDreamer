@@ -6,13 +6,12 @@ from pathlib import Path
 from typing import Dict, Iterable, Optional
 
 import torch
-import torch.nn.functional as F
 from torch import nn
 from torch.utils.data import DataLoader
 
 from src.mynet.dataset import BOPCornerDataset, collate_corner_batch
 from src.mynet.decode import corner_metrics
-from src.mynet.model import CornerResNet34
+from src.mynet.losses import corner_loss
 
 
 def parse_args() -> argparse.Namespace:
@@ -29,6 +28,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--crop-size", type=int, default=256)
     parser.add_argument("--decode-method", choices=["argmax", "subpixel"], default="subpixel")
     parser.add_argument("--subpixel-window", type=int, default=5)
+    parser.add_argument("--fine-loss-weight", type=float, default=2.0)
+    parser.add_argument("--fine-softargmax-temperature", type=float, default=1.0)
+    parser.add_argument("--fine-smooth-l1-beta", type=float, default=1.0)
+    parser.add_argument("--invisible-peak-threshold", type=float, default=0.3)
     parser.add_argument("--pretrained", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
@@ -50,16 +53,6 @@ def make_loader(index_path: Path, data_root: Path, batch_size: int, num_workers:
         drop_last=False,
         collate_fn=collate_corner_batch,
     )
-
-
-def masked_heatmap_mse(logits: torch.Tensor, target: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
-    pred = torch.sigmoid(logits)
-    loss_map = (pred - target) ** 2
-    channel_mask = valid.float().unsqueeze(-1).unsqueeze(-1)
-    denom = channel_mask.sum() * target.shape[-1] * target.shape[-2]
-    if denom.item() <= 0:
-        return loss_map.mean()
-    return (loss_map * channel_mask).sum() / denom
 
 
 def move_to_device(batch: Dict[str, object], device: torch.device) -> Dict[str, object]:
@@ -90,6 +83,8 @@ def train_one_epoch(
 ) -> tuple[Dict[str, float], int]:
     model.train()
     losses = []
+    coarse_losses = []
+    fine_losses = []
     use_amp = args.amp and device.type == "cuda"
 
     for step, batch in enumerate(loader, start=1):
@@ -97,22 +92,45 @@ def train_one_epoch(
         optimizer.zero_grad(set_to_none=True)
         with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
             logits = model(batch["image"])
-            loss = masked_heatmap_mse(logits, batch["heatmap"], batch["corner_valid"])
+            loss_parts = corner_loss(
+                logits,
+                batch["heatmap"],
+                batch["corners_2d_crop"],
+                batch["corner_valid"],
+                crop_size=args.crop_size,
+                fine_loss_weight=args.fine_loss_weight,
+                fine_softargmax_temperature=args.fine_softargmax_temperature,
+                fine_smooth_l1_beta=args.fine_smooth_l1_beta,
+            )
+            loss = loss_parts["loss"]
 
         scaler.scale(loss).backward()
         scaler.step(optimizer)
         scaler.update()
         losses.append(float(loss.item()))
+        coarse_losses.append(float(loss_parts["loss_coarse"].item()))
+        fine_losses.append(float(loss_parts["loss_fine"].item()))
 
         if writer is not None:
             writer.add_scalar("train/loss_step", float(loss.item()), global_step)
+            writer.add_scalar("train/loss_coarse_step", float(loss_parts["loss_coarse"].item()), global_step)
+            writer.add_scalar("train/loss_fine_step", float(loss_parts["loss_fine"].item()), global_step)
             writer.add_scalar("train/lr", optimizer.param_groups[0]["lr"], global_step)
         global_step += 1
 
         if step % args.log_every == 0:
-            print(f"epoch {epoch:03d} step {step:05d}/{len(loader):05d} train_loss={loss.item():.6f}")
+            print(
+                f"epoch {epoch:03d} step {step:05d}/{len(loader):05d}"
+                f" train_loss={loss.item():.6f}"
+                f" coarse={loss_parts['loss_coarse'].item():.6f}"
+                f" fine={loss_parts['loss_fine'].item():.6f}"
+            )
 
-    return {"loss": sum(losses) / max(1, len(losses))}, global_step
+    return {
+        "loss": sum(losses) / max(1, len(losses)),
+        "loss_coarse": sum(coarse_losses) / max(1, len(coarse_losses)),
+        "loss_fine": sum(fine_losses) / max(1, len(fine_losses)),
+    }, global_step
 
 
 @torch.no_grad()
@@ -124,7 +142,16 @@ def evaluate(model: nn.Module, loader: Optional[DataLoader], device: torch.devic
     for batch in loader:
         batch = move_to_device(batch, device)
         logits = model(batch["image"])
-        loss = masked_heatmap_mse(logits, batch["heatmap"], batch["corner_valid"])
+        loss_parts = corner_loss(
+            logits,
+            batch["heatmap"],
+            batch["corners_2d_crop"],
+            batch["corner_valid"],
+            crop_size=args.crop_size,
+            fine_loss_weight=args.fine_loss_weight,
+            fine_softargmax_temperature=args.fine_softargmax_temperature,
+            fine_smooth_l1_beta=args.fine_smooth_l1_beta,
+        )
         metrics = corner_metrics(
             logits,
             batch["corners_2d_crop"],
@@ -132,8 +159,9 @@ def evaluate(model: nn.Module, loader: Optional[DataLoader], device: torch.devic
             crop_size=args.crop_size,
             decode_method=args.decode_method,
             subpixel_window=args.subpixel_window,
+            invisible_peak_threshold=args.invisible_peak_threshold,
         )
-        metrics["loss"] = float(loss.item())
+        metrics.update({key: float(value.item()) for key, value in loss_parts.items()})
         records.append(metrics)
     return aggregate(records)
 
@@ -190,6 +218,8 @@ def main() -> None:
                 collate_fn=collate_corner_batch,
             )
 
+    from src.mynet.model import CornerResNet34
+
     model = CornerResNet34(out_channels=8, pretrained=args.pretrained).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scaler = torch.cuda.amp.GradScaler(enabled=args.amp and device.type == "cuda")
@@ -207,6 +237,8 @@ def main() -> None:
         val_metrics = evaluate(model, val_loader, device, args)
         if writer is not None:
             writer.add_scalar("train/loss_epoch", train_metrics["loss"], epoch)
+            writer.add_scalar("train/loss_coarse_epoch", train_metrics["loss_coarse"], epoch)
+            writer.add_scalar("train/loss_fine_epoch", train_metrics["loss_fine"], epoch)
             for key, value in val_metrics.items():
                 writer.add_scalar(f"val/{key}", value, epoch)
             writer.flush()

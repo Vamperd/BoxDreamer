@@ -92,11 +92,22 @@ def corner_metrics(
     crop_size: int = 256,
     decode_method: str = "subpixel",
     subpixel_window: int = 5,
+    invisible_peak_threshold: float = 0.3,
 ) -> Dict[str, float]:
     pred = decode_heatmap(logits, crop_size=crop_size, decode_method=decode_method, subpixel_window=subpixel_window)
     mask = valid.bool()
+    probs = torch.sigmoid(logits.float())
+    peak_scores = probs.flatten(2).max(dim=2).values
+    invisible_mask = ~mask
+    visible_peak = peak_scores[mask]
+    invisible_peak = peak_scores[invisible_mask]
+    visibility_metrics = {
+        "visible_peak_mean": float(visible_peak.mean().item()) if visible_peak.numel() else 0.0,
+        "invisible_peak_mean": float(invisible_peak.mean().item()) if invisible_peak.numel() else 0.0,
+        "invisible_false_peak_rate": float((invisible_peak > invisible_peak_threshold).float().mean().item()) if invisible_peak.numel() else 0.0,
+    }
     if mask.sum().item() == 0:
-        return {"corner_px": 0.0, "pck_2": 0.0, "pck_5": 0.0, "pck_10": 0.0}
+        return {"corner_px": 0.0, "pck_2": 0.0, "pck_5": 0.0, "pck_10": 0.0, **visibility_metrics}
 
     dist = torch.linalg.norm(pred - target_corners, dim=-1)
     dist_valid = dist[mask]
@@ -105,4 +116,5 @@ def corner_metrics(
         "pck_2": float((dist_valid <= 2.0).float().mean().item()),
         "pck_5": float((dist_valid <= 5.0).float().mean().item()),
         "pck_10": float((dist_valid <= 10.0).float().mean().item()),
+        **visibility_metrics,
     }

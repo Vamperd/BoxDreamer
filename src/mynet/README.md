@@ -148,10 +148,15 @@ python -m src.mynet.train \
 TensorBoard 中主要看这些曲线：
 
 - `train/loss_step`：每个训练 step 的 heatmap MSE，下降越稳定越好。
+- `train/loss_coarse_step`：全 8 通道 heatmap loss；不可见角点通道也参与监督，目标为全 0。
+- `train/loss_fine_step`：只对可见角点计算的归一化坐标 SmoothL1 loss。
 - `train/loss_epoch`：每个 epoch 的平均训练 loss，用于看整体收敛。
-- `val/loss`：验证集 heatmap MSE，是选择 `best.pt` 的主要依据。
+- `val/loss`：验证集总 loss，即 `loss_coarse + fine_loss_weight * loss_fine`。
+- `val/loss_coarse`、`val/loss_fine`：验证集 coarse/fine loss，用于判断热力图监督和坐标监督是否平衡。
 - `val/corner_px`：8 个角点在 crop 坐标下的平均像素误差，越低越好。
 - `val/pck_2`、`val/pck_5`、`val/pck_10`：预测角点落在 2/5/10 像素阈值内的比例，越高越好。
+- `val/invisible_false_peak_rate`：不可见角点 heatmap 峰值超过阈值的比例，越低越好。
+- `val/visible_peak_mean`、`val/invisible_peak_mean`：可见/不可见角点平均峰值，用于检查不可见通道是否被压低。
 - `train/lr`：当前学习率，用于确认训练超参是否符合预期。
 
 判断训练是否有效时，优先看 `val/corner_px` 是否下降、`val/pck_5` 和 `val/pck_10` 是否上升。只看训练 loss 容易误判过拟合。
@@ -240,9 +245,14 @@ RGB crop [B, 3, 256, 256]
 -> ResNet34 backbone
 -> FPN-style upsample head
 -> logits [B, 8, 64, 64]
--> sigmoid(logits)
--> masked MSE heatmap loss
+-> L = L_coarse + fine_loss_weight * L_fine
 ```
+
+当前默认训练目标对齐 BoxDreamer 中 coarse/fine 的处理：
+
+- `L_coarse`：对全部 8 个 heatmap 通道计算 MSE。不可见角点的目标 heatmap 为全 0，因此模型会学习压低不可见角点响应。
+- `L_fine`：使用 soft-argmax 得到归一化 crop 坐标，只对 `corner_valid=1` 的可见角点计算 SmoothL1。
+- 默认 `fine_loss_weight=2.0`，可通过 `--fine-loss-weight` 调整。
 
 网络训练的是 ROI 内 8 个角点热力图。真实视频中同时出现两个 DJI Action4 时，不需要改变 MyNet 本身：检测器先给出两个 bbox，每个 bbox 裁剪成一个 ROI，分别送入 MyNet 得到各自的 8 个角点。
 
