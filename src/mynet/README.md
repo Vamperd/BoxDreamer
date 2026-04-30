@@ -486,6 +486,9 @@ outputs/video_mynet_pipeline/action4_debug/debug/
   detector_bbox_frames/frame_000000.jpg
   roi_inputs/frame_000000_obj_00.jpg
   roi_corners/frame_000000_obj_00.jpg
+  roi_heatmaps/frame_000000_obj_00.jpg
+  roi_heatmap_overlays/frame_000000_obj_00.jpg
+  roi_heatmaps_raw/frame_000000_obj_00.npy
   final_frames/frame_000000.jpg
 ```
 
@@ -494,6 +497,9 @@ outputs/video_mynet_pipeline/action4_debug/debug/
 - `detector_bbox_frames`：detector 或人工 fallback 输出给 MyNet 的 bbox。
 - `roi_inputs`：实际输入 MyNet 的 ROI crop。
 - `roi_corners`：MyNet 在 ROI crop 上的 8 角点结果。
+- `roi_heatmaps`：8 个角点 heatmap 的 2x4 网格图，每格对应一个角点通道。
+- `roi_heatmap_overlays`：8 个角点 heatmap 取最大响应后叠加到 ROI crop 上，便于观察整体响应区域。
+- `roi_heatmaps_raw`：原始 `[8, H, W]` heatmap 数组，便于后续用脚本做数值分析。
 - `final_frames`：角点映射回原视频帧后的最终帧。
 
 短视频或调试时可限制帧数：

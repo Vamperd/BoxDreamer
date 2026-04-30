@@ -231,3 +231,9 @@ python -m src.mynet.predict_video \
   --debug \
   --debug-every 1
 ```
+
+debug 目录会额外保存 MyNet 相关中间结果：
+
+- `roi_heatmaps/*.jpg`：每个 ROI 的 8 个角点 heatmap，按 2x4 网格可视化。
+- `roi_heatmap_overlays/*.jpg`：8 个 heatmap 的最大响应叠加到 ROI crop 上。
+- `roi_heatmaps_raw/*.npy`：原始 `[8, H, W]` heatmap 数组，便于后续数值分析。

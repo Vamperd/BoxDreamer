@@ -164,9 +164,9 @@ def run_mynet_on_detections(
     detections: Sequence[Dict[str, Any]],
     device: torch.device,
     args: argparse.Namespace,
-) -> tuple[List[Dict[str, Any]], List[Image.Image]]:
+) -> tuple[List[Dict[str, Any]], List[Image.Image], np.ndarray]:
     if not detections:
-        return [], []
+        return [], [], np.zeros((0, 8, 1, 1), dtype=np.float32)
 
     frame_rgb = frame_to_pil_rgb(cv2, frame_bgr)
     crops: List[Image.Image] = []
@@ -186,7 +186,8 @@ def run_mynet_on_detections(
         logits = mynet(batch)
 
     corners_crop_batch = decode_heatmap_argmax(logits, crop_size=args.crop_size).detach().cpu().numpy()
-    scores_batch = torch.sigmoid(logits).flatten(2).max(dim=2).values.detach().cpu().numpy()
+    heatmaps_batch = torch.sigmoid(logits).detach().cpu().numpy().astype(np.float32)
+    scores_batch = heatmaps_batch.reshape(heatmaps_batch.shape[0], heatmaps_batch.shape[1], -1).max(axis=2)
 
     predictions: List[Dict[str, Any]] = []
     for idx, (corners_crop, scores, crop_box) in enumerate(zip(corners_crop_batch, scores_batch, crop_boxes)):
@@ -200,7 +201,7 @@ def run_mynet_on_detections(
                 "corner_scores": [float(v) for v in scores],
             }
         )
-    return predictions, crops
+    return predictions, crops, heatmaps_batch
 
 
 def detection_color(det: Dict[str, Any]) -> Tuple[int, int, int]:
@@ -232,6 +233,39 @@ def draw_roi_corners(crop: Image.Image, corners_crop: Sequence[Sequence[float]],
         draw.ellipse((x - r, y - r, x + r, y + r), fill=color)
         draw.text((x + 5, y + 5), f"{idx}:{scores[idx]:.2f}", fill=color)
     return canvas
+
+
+def normalize_heatmap(heatmap: np.ndarray) -> np.ndarray:
+    hm = np.asarray(heatmap, dtype=np.float32)
+    hm = hm - float(hm.min())
+    max_value = float(hm.max())
+    if max_value > 1e-6:
+        hm = hm / max_value
+    return np.clip(hm * 255.0, 0, 255).astype(np.uint8)
+
+
+def heatmap_to_bgr(cv2: Any, heatmap: np.ndarray, size: Tuple[int, int]) -> np.ndarray:
+    resized = cv2.resize(normalize_heatmap(heatmap), size, interpolation=cv2.INTER_LINEAR)
+    return cv2.applyColorMap(resized, cv2.COLORMAP_JET)
+
+
+def draw_heatmap_grid(cv2: Any, heatmaps: np.ndarray, scores: Sequence[float], tile_size: int = 160) -> np.ndarray:
+    tiles = []
+    for idx, heatmap in enumerate(heatmaps):
+        tile = heatmap_to_bgr(cv2, heatmap, (tile_size, tile_size))
+        cv2.putText(tile, f"corner {idx} max={scores[idx]:.2f}", (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 255, 255), 2)
+        cv2.putText(tile, f"corner {idx} max={scores[idx]:.2f}", (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 0, 0), 1)
+        tiles.append(tile)
+    row1 = np.concatenate(tiles[:4], axis=1)
+    row2 = np.concatenate(tiles[4:], axis=1)
+    return np.concatenate([row1, row2], axis=0)
+
+
+def draw_heatmap_overlay(cv2: Any, crop: Image.Image, heatmaps: np.ndarray) -> np.ndarray:
+    crop_bgr = cv2.cvtColor(np.asarray(crop.convert("RGB")), cv2.COLOR_RGB2BGR)
+    merged = heatmaps.max(axis=0)
+    heat_bgr = heatmap_to_bgr(cv2, merged, (crop_bgr.shape[1], crop_bgr.shape[0]))
+    return cv2.addWeighted(crop_bgr, 0.55, heat_bgr, 0.45, 0)
 
 
 def draw_full_frame(
@@ -268,14 +302,18 @@ def save_debug_images(
     bbox_frame: np.ndarray,
     crops: Sequence[Image.Image],
     corner_predictions: Sequence[Dict[str, Any]],
+    heatmaps: np.ndarray,
     final_frame: np.ndarray,
 ) -> None:
     debug_root = out_dir / "debug"
     bbox_dir = debug_root / "detector_bbox_frames"
     roi_input_dir = debug_root / "roi_inputs"
     roi_corner_dir = debug_root / "roi_corners"
+    roi_heatmap_dir = debug_root / "roi_heatmaps"
+    roi_heatmap_overlay_dir = debug_root / "roi_heatmap_overlays"
+    roi_heatmap_raw_dir = debug_root / "roi_heatmaps_raw"
     final_dir = debug_root / "final_frames"
-    for folder in [bbox_dir, roi_input_dir, roi_corner_dir, final_dir]:
+    for folder in [bbox_dir, roi_input_dir, roi_corner_dir, roi_heatmap_dir, roi_heatmap_overlay_dir, roi_heatmap_raw_dir, final_dir]:
         folder.mkdir(parents=True, exist_ok=True)
 
     cv2.imwrite(str(bbox_dir / f"frame_{frame_idx:06d}.jpg"), bbox_frame)
@@ -285,6 +323,13 @@ def save_debug_images(
         if idx < len(corner_predictions):
             roi = draw_roi_corners(crop, corner_predictions[idx]["corners_2d_crop"], corner_predictions[idx]["corner_scores"])
             roi.save(roi_corner_dir / f"frame_{frame_idx:06d}_obj_{idx:02d}.jpg", quality=92)
+        if idx < len(heatmaps):
+            scores = corner_predictions[idx]["corner_scores"] if idx < len(corner_predictions) else [0.0] * 8
+            heatmap_grid = draw_heatmap_grid(cv2, heatmaps[idx], scores)
+            heatmap_overlay = draw_heatmap_overlay(cv2, crop, heatmaps[idx])
+            cv2.imwrite(str(roi_heatmap_dir / f"frame_{frame_idx:06d}_obj_{idx:02d}.jpg"), heatmap_grid)
+            cv2.imwrite(str(roi_heatmap_overlay_dir / f"frame_{frame_idx:06d}_obj_{idx:02d}.jpg"), heatmap_overlay)
+            np.save(roi_heatmap_raw_dir / f"frame_{frame_idx:06d}_obj_{idx:02d}.npy", heatmaps[idx])
 
 
 def jsonl_record(frame_idx: int, fps: float, detections: Sequence[Dict[str, Any]], corners: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
@@ -351,13 +396,13 @@ def process_video(args: argparse.Namespace) -> None:
                 break
 
             detections = detect_frame(detector, frame, args, annotation_lookup, frame_idx)
-            corners, crops = run_mynet_on_detections(cv2, mynet, frame, detections, mynet_device, args)
+            corners, crops, heatmaps = run_mynet_on_detections(cv2, mynet, frame, detections, mynet_device, args)
             bbox_frame = draw_bbox_frame(cv2, frame, detections, args.line_width)
             final_frame = draw_full_frame(cv2, frame, detections, corners, args.line_width)
             writer.write(final_frame)
 
             if args.debug and frame_idx % args.debug_every == 0:
-                save_debug_images(cv2, out_dir, frame_idx, bbox_frame, crops, corners, final_frame)
+                save_debug_images(cv2, out_dir, frame_idx, bbox_frame, crops, corners, heatmaps, final_frame)
 
             record = jsonl_record(frame_idx, fps, detections, corners)
             jsonl.write(json.dumps(record, ensure_ascii=False) + "\n")
