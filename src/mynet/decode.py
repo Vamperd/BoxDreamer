@@ -101,7 +101,10 @@ def corner_metrics(
     invisible_mask = ~mask
     visible_peak = peak_scores[mask]
     invisible_peak = peak_scores[invisible_mask]
+    valid_ratio = float(mask.float().mean().item()) if mask.numel() else 0.0
     visibility_metrics = {
+        "valid_corner_ratio": valid_ratio,
+        "invisible_corner_ratio": 1.0 - valid_ratio,
         "visible_peak_mean": float(visible_peak.mean().item()) if visible_peak.numel() else 0.0,
         "invisible_peak_mean": float(invisible_peak.mean().item()) if invisible_peak.numel() else 0.0,
         "invisible_false_peak_rate": float((invisible_peak > invisible_peak_threshold).float().mean().item()) if invisible_peak.numel() else 0.0,

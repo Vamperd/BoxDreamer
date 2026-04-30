@@ -85,6 +85,7 @@ def train_one_epoch(
     losses = []
     coarse_losses = []
     fine_losses = []
+    valid_corner_ratios = []
     use_amp = args.amp and device.type == "cuda"
 
     for step, batch in enumerate(loader, start=1):
@@ -110,11 +111,15 @@ def train_one_epoch(
         losses.append(float(loss.item()))
         coarse_losses.append(float(loss_parts["loss_coarse"].item()))
         fine_losses.append(float(loss_parts["loss_fine"].item()))
+        valid_ratio = float(batch["corner_valid"].float().mean().item())
+        valid_corner_ratios.append(valid_ratio)
 
         if writer is not None:
             writer.add_scalar("train/loss_step", float(loss.item()), global_step)
             writer.add_scalar("train/loss_coarse_step", float(loss_parts["loss_coarse"].item()), global_step)
             writer.add_scalar("train/loss_fine_step", float(loss_parts["loss_fine"].item()), global_step)
+            writer.add_scalar("train/valid_corner_ratio_step", valid_ratio, global_step)
+            writer.add_scalar("train/invisible_corner_ratio_step", 1.0 - valid_ratio, global_step)
             writer.add_scalar("train/lr", optimizer.param_groups[0]["lr"], global_step)
         global_step += 1
 
@@ -124,12 +129,15 @@ def train_one_epoch(
                 f" train_loss={loss.item():.6f}"
                 f" coarse={loss_parts['loss_coarse'].item():.6f}"
                 f" fine={loss_parts['loss_fine'].item():.6f}"
+                f" valid_ratio={valid_ratio:.3f}"
             )
 
     return {
         "loss": sum(losses) / max(1, len(losses)),
         "loss_coarse": sum(coarse_losses) / max(1, len(coarse_losses)),
         "loss_fine": sum(fine_losses) / max(1, len(fine_losses)),
+        "valid_corner_ratio": sum(valid_corner_ratios) / max(1, len(valid_corner_ratios)),
+        "invisible_corner_ratio": 1.0 - (sum(valid_corner_ratios) / max(1, len(valid_corner_ratios))),
     }, global_step
 
 
@@ -239,6 +247,8 @@ def main() -> None:
             writer.add_scalar("train/loss_epoch", train_metrics["loss"], epoch)
             writer.add_scalar("train/loss_coarse_epoch", train_metrics["loss_coarse"], epoch)
             writer.add_scalar("train/loss_fine_epoch", train_metrics["loss_fine"], epoch)
+            writer.add_scalar("train/valid_corner_ratio_epoch", train_metrics["valid_corner_ratio"], epoch)
+            writer.add_scalar("train/invisible_corner_ratio_epoch", train_metrics["invisible_corner_ratio"], epoch)
             for key, value in val_metrics.items():
                 writer.add_scalar(f"val/{key}", value, epoch)
             writer.flush()
@@ -254,7 +264,10 @@ def main() -> None:
             },
         )
 
-        msg = f"epoch {epoch:03d} train_loss={train_metrics['loss']:.6f}"
+        msg = (
+            f"epoch {epoch:03d} train_loss={train_metrics['loss']:.6f}"
+            f" valid_ratio={train_metrics['valid_corner_ratio']:.3f}"
+        )
         if val_metrics:
             msg += (
                 f" val_loss={val_metrics['loss']:.6f}"

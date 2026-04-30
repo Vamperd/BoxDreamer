@@ -48,6 +48,7 @@ BBox = Tuple[float, float, float, float]
 class BuildConfig:
     bop_root: Path
     output_root: Path
+    corners_meta: Optional[Path]
     obj_id: int
     crop_size: int
     heatmap_size: int
@@ -57,6 +58,7 @@ class BuildConfig:
     seed: int
     min_visib_fract: float
     bbox_source: str
+    corner_visibility_source: str
     debug_vis_limit: int
     max_samples: Optional[int]
     overwrite: bool
@@ -150,6 +152,24 @@ def make_corners_from_models_info(models_info: Dict[str, Any], obj_id: int) -> n
     return corners
 
 
+def load_corners_3d(cfg: BuildConfig) -> np.ndarray:
+    if cfg.corners_meta is not None:
+        meta = load_json(cfg.corners_meta)
+        if "corners_3d" not in meta:
+            raise KeyError(f"`corners_3d` not found in corners meta: {cfg.corners_meta}")
+        corners = np.array(meta["corners_3d"], dtype=np.float32)
+        if corners.shape != (8, 3):
+            raise ValueError(f"`corners_3d` must be [8, 3], got {corners.shape}: {cfg.corners_meta}")
+        return corners
+
+    models_info_path = cfg.bop_root / "models" / "models_info.json"
+    if not models_info_path.exists():
+        raise FileNotFoundError(
+            f"Could not find {models_info_path}. Pass --corners-meta pointing to a MyNet meta.json with corners_3d."
+        )
+    return make_corners_from_models_info(load_json(models_info_path), cfg.obj_id)
+
+
 def project_points(corners_3d: np.ndarray, K: np.ndarray, R: np.ndarray, t: np.ndarray) -> np.ndarray:
     pts_cam = (R @ corners_3d.T).T + t.reshape(1, 3)
     z = pts_cam[:, 2:3]
@@ -162,6 +182,10 @@ def project_points(corners_3d: np.ndarray, K: np.ndarray, R: np.ndarray, t: np.n
     uv[:, 0] = fx * pts_norm[:, 0] + cx
     uv[:, 1] = fy * pts_norm[:, 1] + cy
     return uv
+
+
+def transform_points_camera(corners_3d: np.ndarray, R: np.ndarray, t: np.ndarray) -> np.ndarray:
+    return (R @ corners_3d.T).T + t.reshape(1, 3)
 
 
 def choose_base_bbox(
@@ -242,6 +266,7 @@ def full_to_crop(points: np.ndarray, crop_box: BBox, crop_size: int) -> np.ndarr
 
 def make_heatmaps(
     corners_crop: np.ndarray,
+    corner_visible: Sequence[int],
     crop_size: int,
     heatmap_size: int,
     sigma: float,
@@ -254,7 +279,7 @@ def make_heatmaps(
     for idx, point in enumerate(corners_crop):
         x_hm = float(point[0] * scale)
         y_hm = float(point[1] * scale)
-        is_valid = 0 <= x_hm < heatmap_size and 0 <= y_hm < heatmap_size
+        is_valid = bool(corner_visible[idx]) and 0 <= x_hm < heatmap_size and 0 <= y_hm < heatmap_size
         valid.append(1 if is_valid else 0)
         if not is_valid:
             continue
@@ -324,6 +349,57 @@ def build_val_image_ids(scene_dirs: Sequence[Path], val_ratio: float, seed: int)
     return result
 
 
+def load_scene_corner_annotations(scene_dir: Path, source: str) -> Optional[Dict[str, List[Dict[str, Any]]]]:
+    if source == "crop_bounds":
+        return None
+    if source != "scene_gt_corners":
+        raise ValueError(f"Unsupported corner visibility source: {source}")
+
+    path = scene_dir / "scene_gt_corners.json"
+    if not path.exists():
+        raise FileNotFoundError(f"Corner visibility file not found: {path}. Run scripts/gen_dji_corner_visibility.py first.")
+    data = load_json(path)
+    if isinstance(data, dict) and "frames" in data:
+        return data["frames"]
+    return data
+
+
+def get_corner_visibility(
+    cfg: BuildConfig,
+    scene_corner_annotations: Optional[Dict[str, List[Dict[str, Any]]]],
+    image_id: str,
+    inst_idx: int,
+    obj_id: int,
+    corners_2d_full: np.ndarray,
+    corners_cam: np.ndarray,
+    image_size: Tuple[int, int],
+) -> Tuple[List[int], List[float], List[str], np.ndarray]:
+    if cfg.corner_visibility_source == "crop_bounds":
+        corners_depth = [float(v) for v in corners_cam[:, 2]]
+        return [1] * 8, corners_depth, ["visible"] * 8, corners_2d_full
+
+    if scene_corner_annotations is None:
+        raise RuntimeError("scene corner annotations were not loaded")
+    frame_entries = scene_corner_annotations.get(str(int(image_id)))
+    if frame_entries is None:
+        frame_entries = scene_corner_annotations.get(f"{int(image_id):06d}")
+    if frame_entries is None:
+        raise KeyError(f"No corner visibility entries for image {image_id}")
+    if inst_idx >= len(frame_entries):
+        raise IndexError(f"No corner visibility entry for image {image_id}, instance {inst_idx}")
+
+    entry = frame_entries[inst_idx]
+    if int(entry.get("obj_id", obj_id)) != int(obj_id):
+        raise ValueError(f"Corner visibility obj_id mismatch at image {image_id}, instance {inst_idx}: {entry.get('obj_id')} != {obj_id}")
+    visible = [int(v) for v in entry["corners_visib"]]
+    depth = [float(v) for v in entry.get("corners_depth", corners_cam[:, 2].tolist())]
+    occ_type = [str(v) for v in entry.get("corners_occ_type", ["visible" if v else "unknown" for v in visible])]
+    source_corners = np.array(entry.get("corners_2d", corners_2d_full.tolist()), dtype=np.float32)
+    if source_corners.shape != (8, 2):
+        raise ValueError(f"`corners_2d` must be [8, 2] for image {image_id}, instance {inst_idx}")
+    return visible, depth, occ_type, source_corners
+
+
 def guard_outputs(cfg: BuildConfig) -> None:
     cfg.output_root.mkdir(parents=True, exist_ok=True)
     protected = [cfg.output_root / "train.json", cfg.output_root / "val.json", cfg.output_root / "meta.json"]
@@ -336,8 +412,7 @@ def guard_outputs(cfg: BuildConfig) -> None:
 def build_dataset(cfg: BuildConfig) -> Dict[str, int]:
     guard_outputs(cfg)
 
-    models_info = load_json(cfg.bop_root / "models" / "models_info.json")
-    corners_3d = make_corners_from_models_info(models_info, cfg.obj_id)
+    corners_3d = load_corners_3d(cfg)
     scene_dirs = collect_scene_dirs(cfg.bop_root / "train_pbr")
     val_image_ids = build_val_image_ids(scene_dirs, cfg.val_ratio, cfg.seed)
 
@@ -352,6 +427,7 @@ def build_dataset(cfg: BuildConfig) -> Dict[str, int]:
         scene_camera = load_json(scene_dir / "scene_camera.json")
         scene_gt = load_json(scene_dir / "scene_gt.json")
         scene_info = load_json(scene_dir / "scene_gt_info.json")
+        scene_corner_annotations = load_scene_corner_annotations(scene_dir, cfg.corner_visibility_source)
         rgb_dir = scene_dir / "rgb"
 
         image_ids = sorted(scene_gt.keys(), key=lambda x: int(x))
@@ -373,7 +449,18 @@ def build_dataset(cfg: BuildConfig) -> Dict[str, int]:
 
                 R = np.array(gt["cam_R_m2c"], dtype=np.float32).reshape(3, 3)
                 t = np.array(gt["cam_t_m2c"], dtype=np.float32).reshape(3)
+                corners_cam = transform_points_camera(corners_3d, R, t)
                 corners_2d_full = project_points(corners_3d, K, R, t)
+                corner_visible, corner_depth, corner_occ_type, corners_2d_full = get_corner_visibility(
+                    cfg,
+                    scene_corner_annotations,
+                    f"{int(image_id):06d}",
+                    inst_idx,
+                    int(gt["obj_id"]),
+                    corners_2d_full,
+                    corners_cam,
+                    (image_w, image_h),
+                )
 
                 base_bbox, bbox_source = choose_base_bbox(cfg, scene_dir, f"{int(image_id):06d}", inst_idx, info, corners_2d_full)
                 if not valid_bbox(base_bbox):
@@ -383,7 +470,7 @@ def build_dataset(cfg: BuildConfig) -> Dict[str, int]:
                 crop_box = make_square_crop_box(base_bbox, (image_w, image_h), cfg.padding_ratio)
                 crop_img = crop_with_padding(image, crop_box, cfg.crop_size)
                 corners_2d_crop = full_to_crop(corners_2d_full, crop_box, cfg.crop_size)
-                heatmaps, corner_valid = make_heatmaps(corners_2d_crop, cfg.crop_size, cfg.heatmap_size, cfg.sigma)
+                heatmaps, corner_valid = make_heatmaps(corners_2d_crop, corner_visible, cfg.crop_size, cfg.heatmap_size, cfg.sigma)
 
                 sample_id = f"{scene_id}_{int(image_id):06d}_{inst_idx:06d}"
                 crop_path = cfg.output_root / "crops" / split / f"{sample_id}.png"
@@ -424,6 +511,10 @@ def build_dataset(cfg: BuildConfig) -> Dict[str, int]:
                     "corners_2d_full": corners_2d_full.tolist(),
                     "corners_2d_crop": corners_2d_crop.tolist(),
                     "corner_valid": corner_valid,
+                    "corner_visible": [int(v) for v in corner_visible],
+                    "corner_depth": corner_depth,
+                    "corner_occ_type": corner_occ_type,
+                    "corner_visibility_source": cfg.corner_visibility_source,
                     "visib_fract": float(info.get("visib_fract", 1.0)),
                     "px_count_visib": int(info.get("px_count_visib", 0)),
                     "image_size_full": [image_w, image_h],
@@ -443,6 +534,7 @@ def build_dataset(cfg: BuildConfig) -> Dict[str, int]:
         "object_name": "DJI Action 4",
         "obj_id": cfg.obj_id,
         "source_bop_root": path_for_json(cfg.bop_root, repo_root),
+        "corners_meta": path_for_json(cfg.corners_meta, repo_root) if cfg.corners_meta is not None else None,
         "corner_order": [
             "min_x,min_y,min_z",
             "min_x,max_y,min_z",
@@ -459,6 +551,7 @@ def build_dataset(cfg: BuildConfig) -> Dict[str, int]:
         "sigma": cfg.sigma,
         "crop_padding_ratio": cfg.padding_ratio,
         "bbox_source": cfg.bbox_source,
+        "corner_visibility_source": cfg.corner_visibility_source,
         "min_visib_fract": cfg.min_visib_fract,
         "val_ratio": cfg.val_ratio,
         "seed": cfg.seed,
@@ -481,6 +574,7 @@ def parse_args() -> BuildConfig:
     parser = argparse.ArgumentParser(description="Build MyNet DJI Action4 corner heatmap dataset from BOP train_pbr.")
     parser.add_argument("--bop-root", type=Path, default=Path("dji-action4"), help="Input BOP-style DJI Action4 root.")
     parser.add_argument("--output-root", type=Path, default=Path("data/dji_action4_mynet"), help="Output MyNet dataset root.")
+    parser.add_argument("--corners-meta", type=Path, default=None, help="Optional MyNet meta.json containing corners_3d.")
     parser.add_argument("--obj-id", type=int, default=1)
     parser.add_argument("--crop-size", type=int, default=256)
     parser.add_argument("--heatmap-size", type=int, default=64)
@@ -494,6 +588,12 @@ def parse_args() -> BuildConfig:
         choices=["auto", "mask_visib", "mask", "bbox_visib", "bbox_obj", "projected_corners"],
         default="auto",
     )
+    parser.add_argument(
+        "--corner-visibility-source",
+        choices=["crop_bounds", "scene_gt_corners"],
+        default="crop_bounds",
+        help="Use crop_bounds for legacy projected-corner labels, or scene_gt_corners for generated visibility labels.",
+    )
     parser.add_argument("--debug-vis-limit", type=int, default=100, help="Max debug visualizations per split.")
     parser.add_argument("--max-samples", type=int, default=None, help="Optional smoke-test limit.")
     parser.add_argument("--overwrite", action="store_true", help="Allow replacing existing index/crop/heatmap files.")
@@ -502,6 +602,7 @@ def parse_args() -> BuildConfig:
     return BuildConfig(
         bop_root=args.bop_root,
         output_root=args.output_root,
+        corners_meta=args.corners_meta,
         obj_id=args.obj_id,
         crop_size=args.crop_size,
         heatmap_size=args.heatmap_size,
@@ -511,6 +612,7 @@ def parse_args() -> BuildConfig:
         seed=args.seed,
         min_visib_fract=args.min_visib_fract,
         bbox_source=args.bbox_source,
+        corner_visibility_source=args.corner_visibility_source,
         debug_vis_limit=args.debug_vis_limit,
         max_samples=args.max_samples,
         overwrite=args.overwrite,
