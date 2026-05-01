@@ -48,6 +48,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--crop-size", type=int, default=256)
     parser.add_argument("--decode-method", choices=["argmax", "subpixel"], default="subpixel")
     parser.add_argument("--subpixel-window", type=int, default=5)
+    parser.add_argument("--corner-score-threshold", type=float, default=0.30)
+    parser.add_argument("--corner-render-mode", choices=["both", "visible-only", "completed", "legacy"], default="both")
+    parser.add_argument("--corners-meta", type=Path, default=None, help="MyNet meta.json containing corners_3d. Required for completed rendering.")
+    parser.add_argument("--completion-min-visible", type=int, default=4)
+    parser.add_argument("--smooth-alpha", type=float, default=0.65)
     parser.add_argument("--annotations-json", type=Path, default=None)
     parser.add_argument("--fallback-to-annotations", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=True)
@@ -74,6 +79,31 @@ def load_detector(weights: Path) -> Any:
     except ImportError as exc:
         raise RuntimeError("Ultralytics is not installed. Run: uv pip install ultralytics") from exc
     return YOLO(str(weights))
+
+
+def load_corners_3d(path: Optional[Path]) -> np.ndarray:
+    if path is None:
+        raise ValueError("--corners-meta is required when --corner-render-mode includes completed output.")
+    if not path.exists():
+        raise FileNotFoundError(f"Corners meta not found: {path}")
+    with path.open("r", encoding="utf-8") as f:
+        data = json.load(f)
+    corners = np.asarray(data.get("corners_3d"), dtype=np.float32)
+    if corners.shape != (8, 3):
+        raise ValueError(f"`corners_3d` must be shaped [8, 3] in {path}, got {corners.shape}")
+    return corners
+
+
+def active_render_modes(render_mode: str) -> List[str]:
+    if render_mode == "both":
+        return ["visible-only", "completed"]
+    return [render_mode]
+
+
+def render_mode_suffix(mode: str) -> str:
+    if mode == "visible-only":
+        return "visible_only"
+    return mode
 
 
 def load_annotation_lookup(path: Optional[Path]) -> Dict[int, List[BBox]]:
@@ -275,12 +305,117 @@ def draw_heatmap_overlay(cv2: Any, crop: Image.Image, heatmaps: np.ndarray) -> n
     return cv2.addWeighted(crop_bgr, 0.55, heat_bgr, 0.45, 0)
 
 
+def fit_affine_completion(
+    corners_3d: np.ndarray,
+    corners_2d: np.ndarray,
+    scores: np.ndarray,
+    visible_mask: np.ndarray,
+    min_visible: int,
+) -> Optional[np.ndarray]:
+    if int(visible_mask.sum()) < min_visible:
+        return None
+    x_all = np.concatenate([corners_3d.astype(np.float32), np.ones((8, 1), dtype=np.float32)], axis=1)
+    x = x_all[visible_mask]
+    y = corners_2d.astype(np.float32)[visible_mask]
+    weights = np.sqrt(np.clip(scores.astype(np.float32)[visible_mask], 1e-3, 1.0))[:, None]
+    try:
+        coeff, *_ = np.linalg.lstsq(x * weights, y * weights, rcond=None)
+    except np.linalg.LinAlgError:
+        return None
+    completed = x_all @ coeff
+    if not np.isfinite(completed).all():
+        return None
+    return completed.astype(np.float32)
+
+
+def complete_corner_predictions(
+    corner_predictions: Sequence[Dict[str, Any]],
+    corners_3d: Optional[np.ndarray],
+    args: argparse.Namespace,
+    history: Dict[int, Dict[str, np.ndarray]],
+) -> None:
+    needs_completion = args.corner_render_mode in {"both", "completed"}
+    for pred in corner_predictions:
+        instance_id = int(pred["instance_id"])
+        raw = np.asarray(pred["corners_2d_full"], dtype=np.float32)
+        scores = np.asarray(pred["corner_scores"], dtype=np.float32)
+        visible_mask = scores >= float(args.corner_score_threshold)
+        completed_mask = np.zeros(8, dtype=bool)
+        render_mask = visible_mask.copy()
+        final = raw.copy()
+        previous = history.get(instance_id)
+
+        if needs_completion:
+            affine = fit_affine_completion(corners_3d, raw, scores, visible_mask, args.completion_min_visible) if corners_3d is not None else None
+            if affine is not None:
+                low_mask = ~visible_mask
+                final[low_mask] = affine[low_mask]
+                completed_mask[low_mask] = True
+                render_mask[low_mask] = True
+            elif previous is not None:
+                previous_valid = previous["valid"].astype(bool)
+                fallback_mask = (~visible_mask) & previous_valid
+                final[fallback_mask] = previous["corners"][fallback_mask]
+                completed_mask[fallback_mask] = True
+                render_mask[fallback_mask] = True
+
+            if previous is not None:
+                previous_valid = previous["valid"].astype(bool)
+                smooth_mask = render_mask & previous_valid
+                final[smooth_mask] = float(args.smooth_alpha) * final[smooth_mask] + (1.0 - float(args.smooth_alpha)) * previous["corners"][smooth_mask]
+
+            new_corners = previous["corners"].copy() if previous is not None else np.zeros_like(final)
+            new_valid = previous["valid"].copy() if previous is not None else np.zeros(8, dtype=bool)
+            new_corners[render_mask] = final[render_mask]
+            new_valid[render_mask] = True
+            history[instance_id] = {"corners": new_corners, "valid": new_valid}
+
+        pred["corner_visible_pred"] = [bool(v) for v in visible_mask.tolist()]
+        pred["corner_rendered"] = [bool(v) for v in render_mask.tolist()]
+        pred["corner_completed"] = [bool(v) for v in completed_mask.tolist()]
+        pred["corners_2d_completed_full"] = final.astype(float).tolist()
+
+
+def draw_filtered_corners(
+    cv2: Any,
+    canvas: np.ndarray,
+    corners: Sequence[Sequence[float]],
+    render_mask: Sequence[bool],
+    completed_mask: Optional[Sequence[bool]],
+    line_width: int,
+) -> None:
+    for a, b in EDGES:
+        if not (render_mask[a] and render_mask[b]):
+            continue
+        pa = tuple(int(round(v)) for v in corners[a])
+        pb = tuple(int(round(v)) for v in corners[b])
+        edge_has_completed = completed_mask is not None and (completed_mask[a] or completed_mask[b])
+        color = (180, 180, 180) if edge_has_completed else (255, 255, 255)
+        cv2.line(canvas, pa, pb, color, line_width)
+
+    for idx, point in enumerate(corners):
+        if not render_mask[idx]:
+            continue
+        rgb = CORNER_COLORS_RGB[idx]
+        bgr = rgb[2], rgb[1], rgb[0]
+        x, y = int(round(point[0])), int(round(point[1]))
+        is_completed = completed_mask is not None and bool(completed_mask[idx])
+        if is_completed:
+            cv2.circle(canvas, (x, y), 6, bgr, max(1, line_width))
+            label = f"{idx}c"
+        else:
+            cv2.circle(canvas, (x, y), 5, bgr, -1)
+            label = str(idx)
+        cv2.putText(canvas, label, (x + 6, y + 6), cv2.FONT_HERSHEY_SIMPLEX, 0.6, bgr, 2)
+
+
 def draw_full_frame(
     cv2: Any,
     frame_bgr: np.ndarray,
     detections: Sequence[Dict[str, Any]],
     corner_predictions: Sequence[Dict[str, Any]],
     line_width: int,
+    render_mode: str = "legacy",
 ) -> np.ndarray:
     canvas = draw_bbox_frame(cv2, frame_bgr, detections, line_width)
     corners_by_id = {int(item["instance_id"]): item for item in corner_predictions}
@@ -288,17 +423,21 @@ def draw_full_frame(
         pred = corners_by_id.get(int(det["instance_id"]))
         if pred is None:
             continue
-        corners = pred["corners_2d_full"]
-        for a, b in EDGES:
-            pa = tuple(int(round(v)) for v in corners[a])
-            pb = tuple(int(round(v)) for v in corners[b])
-            cv2.line(canvas, pa, pb, (255, 255, 255), line_width)
-        for idx, point in enumerate(corners):
-            rgb = CORNER_COLORS_RGB[idx]
-            bgr = rgb[2], rgb[1], rgb[0]
-            x, y = int(round(point[0])), int(round(point[1]))
-            cv2.circle(canvas, (x, y), 5, bgr, -1)
-            cv2.putText(canvas, str(idx), (x + 6, y + 6), cv2.FONT_HERSHEY_SIMPLEX, 0.6, bgr, 2)
+        if render_mode == "legacy":
+            corners = pred["corners_2d_full"]
+            render_mask = [True] * 8
+            completed_mask = [False] * 8
+        elif render_mode == "visible-only":
+            corners = pred["corners_2d_full"]
+            render_mask = pred.get("corner_visible_pred", [True] * 8)
+            completed_mask = [False] * 8
+        elif render_mode == "completed":
+            corners = pred.get("corners_2d_completed_full", pred["corners_2d_full"])
+            render_mask = pred.get("corner_rendered", pred.get("corner_visible_pred", [True] * 8))
+            completed_mask = pred.get("corner_completed", [False] * 8)
+        else:
+            raise ValueError(f"Unsupported render mode: {render_mode}")
+        draw_filtered_corners(cv2, canvas, corners, render_mask, completed_mask, line_width)
     return canvas
 
 
@@ -365,12 +504,22 @@ def process_video(args: argparse.Namespace) -> None:
         raise ValueError("--max-detections must be positive.")
     if args.debug_every <= 0:
         raise ValueError("--debug-every must be positive.")
+    if not 0.0 <= args.corner_score_threshold <= 1.0:
+        raise ValueError("--corner-score-threshold must be between 0 and 1.")
+    if args.completion_min_visible < 4 or args.completion_min_visible > 8:
+        raise ValueError("--completion-min-visible must be between 4 and 8 for affine completion.")
+    if not 0.0 <= args.smooth_alpha <= 1.0:
+        raise ValueError("--smooth-alpha must be between 0 and 1.")
 
     cv2 = load_cv2()
     detector = load_detector(args.detector_weights)
     mynet_device = torch.device(args.mynet_device)
     mynet = load_model(args.mynet_checkpoint, mynet_device)
     annotation_lookup = load_annotation_lookup(args.annotations_json) if args.fallback_to_annotations else {}
+    modes = active_render_modes(args.corner_render_mode)
+    needs_completion = "completed" in modes
+    corners_3d = load_corners_3d(args.corners_meta) if needs_completion else None
+    completion_history: Dict[int, Dict[str, np.ndarray]] = {}
 
     cap = cv2.VideoCapture(str(args.video))
     if not cap.isOpened():
@@ -385,14 +534,31 @@ def process_video(args: argparse.Namespace) -> None:
 
     out_dir = args.output_dir / args.name
     out_dir.mkdir(parents=True, exist_ok=True)
-    video_out = out_dir / f"{args.name}.mp4"
-    writer = cv2.VideoWriter(str(video_out), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
-    if not writer.isOpened():
+    output_videos = {
+        mode: out_dir / (f"{args.name}.mp4" if mode == "legacy" else f"{args.name}_{render_mode_suffix(mode)}.mp4")
+        for mode in modes
+    }
+    writers = {
+        mode: cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
+        for mode, path in output_videos.items()
+    }
+    unopened = [str(output_videos[mode]) for mode, writer in writers.items() if not writer.isOpened()]
+    if unopened:
         cap.release()
-        raise RuntimeError(f"Could not open video writer: {video_out}")
+        for writer in writers.values():
+            writer.release()
+        raise RuntimeError(f"Could not open video writer(s): {', '.join(unopened)}")
 
     jsonl_path = out_dir / "predictions.jsonl"
-    counts = {"frames": 0, "frames_with_detections": 0, "model_detections": 0, "annotation_detections": 0, "corner_predictions": 0}
+    counts = {
+        "frames": 0,
+        "frames_with_detections": 0,
+        "model_detections": 0,
+        "annotation_detections": 0,
+        "corner_predictions": 0,
+        "visible_corners_rendered": 0,
+        "completed_corners_rendered": 0,
+    }
     with jsonl_path.open("w", encoding="utf-8") as jsonl:
         frame_idx = 0
         while True:
@@ -404,12 +570,25 @@ def process_video(args: argparse.Namespace) -> None:
 
             detections = detect_frame(detector, frame, args, annotation_lookup, frame_idx)
             corners, crops, heatmaps = run_mynet_on_detections(cv2, mynet, frame, detections, mynet_device, args)
+            complete_corner_predictions(corners, corners_3d, args, completion_history)
             bbox_frame = draw_bbox_frame(cv2, frame, detections, args.line_width)
-            final_frame = draw_full_frame(cv2, frame, detections, corners, args.line_width)
-            writer.write(final_frame)
+            final_frames = {
+                mode: draw_full_frame(cv2, frame, detections, corners, args.line_width, render_mode=mode)
+                for mode in modes
+            }
+            for mode, writer in writers.items():
+                writer.write(final_frames[mode])
 
             if args.debug and frame_idx % args.debug_every == 0:
-                save_debug_images(cv2, out_dir, frame_idx, bbox_frame, crops, corners, heatmaps, final_frame)
+                if "completed" in final_frames:
+                    debug_frame = final_frames["completed"]
+                elif "visible-only" in final_frames:
+                    debug_frame = final_frames["visible-only"]
+                elif "legacy" in final_frames:
+                    debug_frame = final_frames["legacy"]
+                else:
+                    debug_frame = bbox_frame
+                save_debug_images(cv2, out_dir, frame_idx, bbox_frame, crops, corners, heatmaps, debug_frame)
 
             record = jsonl_record(frame_idx, fps, detections, corners)
             jsonl.write(json.dumps(record, ensure_ascii=False) + "\n")
@@ -419,17 +598,20 @@ def process_video(args: argparse.Namespace) -> None:
             counts["model_detections"] += sum(1 for det in detections if det["source"] == "model")
             counts["annotation_detections"] += sum(1 for det in detections if det["source"] == "annotation")
             counts["corner_predictions"] += len(corners)
+            counts["visible_corners_rendered"] += sum(sum(1 for item in pred.get("corner_visible_pred", []) if item) for pred in corners)
+            counts["completed_corners_rendered"] += sum(sum(1 for item in pred.get("corner_completed", []) if item) for pred in corners)
 
             frame_idx += 1
             if frame_idx % 100 == 0:
                 print(f"processed {frame_idx}/{total_frames or '?'} frames")
 
     cap.release()
-    writer.release()
+    for writer in writers.values():
+        writer.release()
 
     summary = {
         "video": str(args.video),
-        "output_video": str(video_out),
+        "output_videos": {mode: str(path) for mode, path in output_videos.items()},
         "predictions_jsonl": str(jsonl_path),
         "detector_weights": str(args.detector_weights),
         "mynet_checkpoint": str(args.mynet_checkpoint),
@@ -443,7 +625,8 @@ def process_video(args: argparse.Namespace) -> None:
     with (out_dir / "summary.json").open("w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
 
-    print(f"saved video: {video_out}")
+    for mode, path in output_videos.items():
+        print(f"saved {mode} video: {path}")
     print(f"saved predictions: {jsonl_path}")
     print(f"saved summary: {out_dir / 'summary.json'}")
 
