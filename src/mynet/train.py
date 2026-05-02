@@ -28,9 +28,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--crop-size", type=int, default=256)
     parser.add_argument("--decode-method", choices=["argmax", "subpixel"], default="subpixel")
     parser.add_argument("--subpixel-window", type=int, default=5)
-    parser.add_argument("--fine-loss-weight", type=float, default=2.0)
-    parser.add_argument("--fine-softargmax-temperature", type=float, default=1.0)
-    parser.add_argument("--fine-smooth-l1-beta", type=float, default=1.0)
     parser.add_argument("--invisible-peak-threshold", type=float, default=0.3)
     parser.add_argument("--pretrained", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=True)
@@ -83,8 +80,6 @@ def train_one_epoch(
 ) -> tuple[Dict[str, float], int]:
     model.train()
     losses = []
-    coarse_losses = []
-    fine_losses = []
     valid_corner_ratios = []
     use_amp = args.amp and device.type == "cuda"
 
@@ -93,33 +88,19 @@ def train_one_epoch(
         optimizer.zero_grad(set_to_none=True)
         with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
             logits = model(batch["image"])
-            loss_parts = corner_loss(
-                logits,
-                batch["heatmap"],
-                batch["corners_2d_crop"],
-                batch["corner_valid"],
-                crop_size=args.crop_size,
-                fine_loss_weight=args.fine_loss_weight,
-                fine_softargmax_temperature=args.fine_softargmax_temperature,
-                fine_smooth_l1_beta=args.fine_smooth_l1_beta,
-            )
+            loss_parts = corner_loss(logits, batch["heatmap"])
             loss = loss_parts["loss"]
 
         scaler.scale(loss).backward()
         scaler.step(optimizer)
         scaler.update()
         losses.append(float(loss.item()))
-        coarse_losses.append(float(loss_parts["loss_coarse"].item()))
-        fine_losses.append(float(loss_parts["loss_fine"].item()))
         valid_ratio = float(batch["corner_valid"].float().mean().item())
         valid_corner_ratios.append(valid_ratio)
 
         if writer is not None:
             writer.add_scalar("train/loss_step", float(loss.item()), global_step)
-            writer.add_scalar("train/loss_coarse_step", float(loss_parts["loss_coarse"].item()), global_step)
-            writer.add_scalar("train/loss_fine_step", float(loss_parts["loss_fine"].item()), global_step)
             writer.add_scalar("train/valid_corner_ratio_step", valid_ratio, global_step)
-            writer.add_scalar("train/invisible_corner_ratio_step", 1.0 - valid_ratio, global_step)
             writer.add_scalar("train/lr", optimizer.param_groups[0]["lr"], global_step)
         global_step += 1
 
@@ -127,17 +108,12 @@ def train_one_epoch(
             print(
                 f"epoch {epoch:03d} step {step:05d}/{len(loader):05d}"
                 f" train_loss={loss.item():.6f}"
-                f" coarse={loss_parts['loss_coarse'].item():.6f}"
-                f" fine={loss_parts['loss_fine'].item():.6f}"
                 f" valid_ratio={valid_ratio:.3f}"
             )
 
     return {
         "loss": sum(losses) / max(1, len(losses)),
-        "loss_coarse": sum(coarse_losses) / max(1, len(coarse_losses)),
-        "loss_fine": sum(fine_losses) / max(1, len(fine_losses)),
         "valid_corner_ratio": sum(valid_corner_ratios) / max(1, len(valid_corner_ratios)),
-        "invisible_corner_ratio": 1.0 - (sum(valid_corner_ratios) / max(1, len(valid_corner_ratios))),
     }, global_step
 
 
@@ -150,16 +126,7 @@ def evaluate(model: nn.Module, loader: Optional[DataLoader], device: torch.devic
     for batch in loader:
         batch = move_to_device(batch, device)
         logits = model(batch["image"])
-        loss_parts = corner_loss(
-            logits,
-            batch["heatmap"],
-            batch["corners_2d_crop"],
-            batch["corner_valid"],
-            crop_size=args.crop_size,
-            fine_loss_weight=args.fine_loss_weight,
-            fine_softargmax_temperature=args.fine_softargmax_temperature,
-            fine_smooth_l1_beta=args.fine_smooth_l1_beta,
-        )
+        loss_parts = corner_loss(logits, batch["heatmap"])
         metrics = corner_metrics(
             logits,
             batch["corners_2d_crop"],
@@ -245,10 +212,7 @@ def main() -> None:
         val_metrics = evaluate(model, val_loader, device, args)
         if writer is not None:
             writer.add_scalar("train/loss_epoch", train_metrics["loss"], epoch)
-            writer.add_scalar("train/loss_coarse_epoch", train_metrics["loss_coarse"], epoch)
-            writer.add_scalar("train/loss_fine_epoch", train_metrics["loss_fine"], epoch)
             writer.add_scalar("train/valid_corner_ratio_epoch", train_metrics["valid_corner_ratio"], epoch)
-            writer.add_scalar("train/invisible_corner_ratio_epoch", train_metrics["invisible_corner_ratio"], epoch)
             for key, value in val_metrics.items():
                 writer.add_scalar(f"val/{key}", value, epoch)
             writer.flush()

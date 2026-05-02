@@ -24,9 +24,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--crop-size", type=int, default=256)
     parser.add_argument("--decode-method", choices=["argmax", "subpixel"], default="subpixel")
     parser.add_argument("--subpixel-window", type=int, default=5)
-    parser.add_argument("--fine-loss-weight", type=float, default=2.0)
-    parser.add_argument("--fine-softargmax-temperature", type=float, default=1.0)
-    parser.add_argument("--fine-smooth-l1-beta", type=float, default=1.0)
     parser.add_argument("--invisible-peak-threshold", type=float, default=0.3)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=True)
@@ -76,16 +73,7 @@ def evaluate(args: argparse.Namespace) -> Dict[str, object]:
         batch = move_to_device(batch, device)
         with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
             logits = model(batch["image"])
-            loss_parts = corner_loss(
-                logits,
-                batch["heatmap"],
-                batch["corners_2d_crop"],
-                batch["corner_valid"],
-                crop_size=args.crop_size,
-                fine_loss_weight=args.fine_loss_weight,
-                fine_softargmax_temperature=args.fine_softargmax_temperature,
-                fine_smooth_l1_beta=args.fine_smooth_l1_beta,
-            )
+            loss_parts = corner_loss(logits, batch["heatmap"])
         metrics = corner_metrics(
             logits,
             batch["corners_2d_crop"],
@@ -107,9 +95,6 @@ def evaluate(args: argparse.Namespace) -> Dict[str, object]:
         "crop_size": args.crop_size,
         "decode_method": args.decode_method,
         "subpixel_window": args.subpixel_window,
-        "fine_loss_weight": args.fine_loss_weight,
-        "fine_softargmax_temperature": args.fine_softargmax_temperature,
-        "fine_smooth_l1_beta": args.fine_smooth_l1_beta,
         "invisible_peak_threshold": args.invisible_peak_threshold,
         "metrics": metrics,
     }
