@@ -54,6 +54,7 @@ class BuildConfig:
     heatmap_size: int
     sigma: float
     padding_ratio: float
+    padding_pixels: Optional[float]
     val_ratio: float
     seed: int
     min_visib_fract: float
@@ -129,6 +130,18 @@ def bbox_from_points(points: np.ndarray) -> Optional[BBox]:
     )
 
 
+def union_bboxes(boxes: Sequence[Optional[BBox]]) -> Optional[BBox]:
+    valid_boxes = [box for box in boxes if valid_bbox(box)]
+    if not valid_boxes:
+        return None
+    return (
+        min(float(box[0]) for box in valid_boxes),
+        min(float(box[1]) for box in valid_boxes),
+        max(float(box[2]) for box in valid_boxes),
+        max(float(box[3]) for box in valid_boxes),
+    )
+
+
 def make_corners_from_models_info(models_info: Dict[str, Any], obj_id: int) -> np.ndarray:
     info = models_info[str(obj_id)]
     min_x, max_x = float(info["min_x"]), float(info["max_x"])
@@ -198,26 +211,38 @@ def choose_base_bbox(
 ) -> Tuple[Optional[BBox], str]:
     mask_path = scene_dir / "mask" / f"{image_id}_{inst_idx:06d}.png"
     mask_visib_path = scene_dir / "mask_visib" / f"{image_id}_{inst_idx:06d}.png"
+    mask_visib_box = bbox_from_mask(mask_visib_path)
+    mask_box = bbox_from_mask(mask_path)
+    bbox_visib = bbox_xywh_to_xyxy(info.get("bbox_visib", []))
+    bbox_obj = bbox_xywh_to_xyxy(info.get("bbox_obj", []))
+    projected_box = bbox_from_points(projected_corners)
 
     candidates: List[Tuple[str, Optional[BBox]]] = []
     if cfg.bbox_source == "auto":
         candidates = [
-            ("mask_visib", bbox_from_mask(mask_visib_path)),
-            ("bbox_visib", bbox_xywh_to_xyxy(info.get("bbox_visib", []))),
-            ("mask", bbox_from_mask(mask_path)),
-            ("bbox_obj", bbox_xywh_to_xyxy(info.get("bbox_obj", []))),
-            ("projected_corners", bbox_from_points(projected_corners)),
+            ("mask_visib", mask_visib_box),
+            ("bbox_visib", bbox_visib),
+            ("mask", mask_box),
+            ("bbox_obj", bbox_obj),
+            ("projected_corners", projected_box),
+        ]
+    elif cfg.bbox_source == "mask_projected_union":
+        candidates = [
+            ("mask_projected_union", union_bboxes([mask_visib_box, bbox_visib, mask_box, bbox_obj, projected_box])),
+            ("projected_corners", projected_box),
+            ("mask_visib", mask_visib_box),
+            ("bbox_visib", bbox_visib),
         ]
     elif cfg.bbox_source == "mask_visib":
-        candidates = [("mask_visib", bbox_from_mask(mask_visib_path))]
+        candidates = [("mask_visib", mask_visib_box)]
     elif cfg.bbox_source == "mask":
-        candidates = [("mask", bbox_from_mask(mask_path))]
+        candidates = [("mask", mask_box)]
     elif cfg.bbox_source == "bbox_visib":
-        candidates = [("bbox_visib", bbox_xywh_to_xyxy(info.get("bbox_visib", [])))]
+        candidates = [("bbox_visib", bbox_visib)]
     elif cfg.bbox_source == "bbox_obj":
-        candidates = [("bbox_obj", bbox_xywh_to_xyxy(info.get("bbox_obj", [])))]
+        candidates = [("bbox_obj", bbox_obj)]
     elif cfg.bbox_source == "projected_corners":
-        candidates = [("projected_corners", bbox_from_points(projected_corners))]
+        candidates = [("projected_corners", projected_box)]
     else:
         raise ValueError(f"Unsupported bbox source: {cfg.bbox_source}")
 
@@ -227,10 +252,18 @@ def choose_base_bbox(
     return None, "none"
 
 
-def make_square_crop_box(box: BBox, image_size: Tuple[int, int], padding_ratio: float) -> BBox:
+def make_square_crop_box(
+    box: BBox,
+    image_size: Tuple[int, int],
+    padding_ratio: float,
+    padding_pixels: Optional[float] = None,
+) -> BBox:
     x1, y1, x2, y2 = box
     w, h = x2 - x1, y2 - y1
-    side = max(w, h) * (1.0 + 2.0 * padding_ratio)
+    if padding_pixels is not None:
+        side = max(w, h) + 2.0 * padding_pixels
+    else:
+        side = max(w, h) * (1.0 + 2.0 * padding_ratio)
     cx, cy = (x1 + x2) * 0.5, (y1 + y2) * 0.5
     half = side * 0.5
     return cx - half, cy - half, cx + half, cy + half
@@ -350,7 +383,7 @@ def build_val_image_ids(scene_dirs: Sequence[Path], val_ratio: float, seed: int)
 
 
 def load_scene_corner_annotations(scene_dir: Path, source: str) -> Optional[Dict[str, List[Dict[str, Any]]]]:
-    if source == "crop_bounds":
+    if source in {"all_corners", "crop_bounds"}:
         return None
     if source != "scene_gt_corners":
         raise ValueError(f"Unsupported corner visibility source: {source}")
@@ -374,7 +407,7 @@ def get_corner_visibility(
     corners_cam: np.ndarray,
     image_size: Tuple[int, int],
 ) -> Tuple[List[int], List[float], List[str], np.ndarray]:
-    if cfg.corner_visibility_source == "crop_bounds":
+    if cfg.corner_visibility_source in {"all_corners", "crop_bounds"}:
         corners_depth = [float(v) for v in corners_cam[:, 2]]
         return [1] * 8, corners_depth, ["visible"] * 8, corners_2d_full
 
@@ -467,7 +500,7 @@ def build_dataset(cfg: BuildConfig) -> Dict[str, int]:
                     skipped += 1
                     continue
 
-                crop_box = make_square_crop_box(base_bbox, (image_w, image_h), cfg.padding_ratio)
+                crop_box = make_square_crop_box(base_bbox, (image_w, image_h), cfg.padding_ratio, cfg.padding_pixels)
                 crop_img = crop_with_padding(image, crop_box, cfg.crop_size)
                 corners_2d_crop = full_to_crop(corners_2d_full, crop_box, cfg.crop_size)
                 heatmaps, corner_valid = make_heatmaps(corners_2d_crop, corner_visible, cfg.crop_size, cfg.heatmap_size, cfg.sigma)
@@ -507,6 +540,8 @@ def build_dataset(cfg: BuildConfig) -> Dict[str, int]:
                     "bbox_source": bbox_source,
                     "bbox_xyxy_full": [float(v) for v in base_bbox],
                     "crop_box_xyxy_full": [float(v) for v in crop_box],
+                    "crop_padding_ratio": cfg.padding_ratio,
+                    "crop_padding_pixels": cfg.padding_pixels,
                     "corners_3d": corners_3d.tolist(),
                     "corners_2d_full": corners_2d_full.tolist(),
                     "corners_2d_crop": corners_2d_crop.tolist(),
@@ -550,6 +585,7 @@ def build_dataset(cfg: BuildConfig) -> Dict[str, int]:
         "heatmap_size": cfg.heatmap_size,
         "sigma": cfg.sigma,
         "crop_padding_ratio": cfg.padding_ratio,
+        "crop_padding_pixels": cfg.padding_pixels,
         "bbox_source": cfg.bbox_source,
         "corner_visibility_source": cfg.corner_visibility_source,
         "min_visib_fract": cfg.min_visib_fract,
@@ -579,25 +615,36 @@ def parse_args() -> BuildConfig:
     parser.add_argument("--crop-size", type=int, default=256)
     parser.add_argument("--heatmap-size", type=int, default=64)
     parser.add_argument("--sigma", type=float, default=2.0)
-    parser.add_argument("--padding-ratio", type=float, default=0.25)
+    parser.add_argument("--padding-ratio", type=float, default=0.10, help="Padding as a ratio of the square bbox side.")
+    parser.add_argument(
+        "--padding-pixels",
+        type=float,
+        default=None,
+        help="Absolute padding pixels added to each side before square crop. Overrides --padding-ratio when set.",
+    )
     parser.add_argument("--val-ratio", type=float, default=0.2)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--min-visib-fract", type=float, default=0.05)
     parser.add_argument(
         "--bbox-source",
-        choices=["auto", "mask_visib", "mask", "bbox_visib", "bbox_obj", "projected_corners"],
-        default="auto",
+        choices=["auto", "mask_projected_union", "mask_visib", "mask", "bbox_visib", "bbox_obj", "projected_corners"],
+        default="mask_projected_union",
     )
     parser.add_argument(
         "--corner-visibility-source",
-        choices=["crop_bounds", "scene_gt_corners"],
-        default="crop_bounds",
-        help="Use crop_bounds for legacy projected-corner labels, or scene_gt_corners for generated visibility labels.",
+        choices=["all_corners", "crop_bounds", "scene_gt_corners"],
+        default="all_corners",
+        help="Use all_corners for full 8-corner supervision, or scene_gt_corners for generated visibility labels.",
     )
     parser.add_argument("--debug-vis-limit", type=int, default=100, help="Max debug visualizations per split.")
     parser.add_argument("--max-samples", type=int, default=None, help="Optional smoke-test limit.")
     parser.add_argument("--overwrite", action="store_true", help="Allow replacing existing index/crop/heatmap files.")
     args = parser.parse_args()
+
+    if args.padding_ratio < 0:
+        raise ValueError("--padding-ratio must be non-negative.")
+    if args.padding_pixels is not None and args.padding_pixels < 0:
+        raise ValueError("--padding-pixels must be non-negative.")
 
     return BuildConfig(
         bop_root=args.bop_root,
@@ -608,6 +655,7 @@ def parse_args() -> BuildConfig:
         heatmap_size=args.heatmap_size,
         sigma=args.sigma,
         padding_ratio=args.padding_ratio,
+        padding_pixels=args.padding_pixels,
         val_ratio=args.val_ratio,
         seed=args.seed,
         min_visib_fract=args.min_visib_fract,

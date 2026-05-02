@@ -335,7 +335,7 @@ python -m src.mynet.infer_image \
   --output-dir outputs/mynet_infer/image_png \
   --bbox 120,80,420,360 \
   --bbox 520,90,810,350 \
-  --bbox-padding 0.25 \
+  --bbox-padding 0.10 \
   --device cuda
 ```
 
@@ -384,7 +384,7 @@ python -m src.mynet.annotate_video \
   --crop-size 256 \
   --heatmap-size 64 \
   --sigma 2.0 \
-  --bbox-padding 0.25
+  --bbox-padding 0.10
 ```
 
 每个候选帧的流程：
@@ -451,7 +451,7 @@ python -m src.mynet.annotate_bbox_corners \
   --crop-size 256 \
   --heatmap-size 64 \
   --sigma 2.0 \
-  --bbox-padding 0.25
+  --bbox-padding 0.10
 ```
 
 该脚本会读取已有 `annotations.json` 中的 `bbox_only` 记录，在 ROI crop 上标角点，并把原记录升级为 `full`。常用筛选：

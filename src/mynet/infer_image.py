@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from typing import Any, Dict, List, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -43,7 +43,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--bbox-json", type=Path, default=None, help="Optional JSON containing a list of bboxes or {'bboxes': [...]}.")
     parser.add_argument("--min-bboxes", type=int, default=1, help="Minimum number of bboxes to run.")
     parser.add_argument("--max-bboxes", type=int, default=2, help="Maximum number of bboxes to run.")
-    parser.add_argument("--bbox-padding", type=float, default=0.25, help="Padding ratio applied before square ROI crop.")
+    parser.add_argument("--bbox-padding", type=float, default=0.10, help="Padding ratio applied before square ROI crop.")
+    parser.add_argument(
+        "--bbox-padding-pixels",
+        type=float,
+        default=None,
+        help="Absolute padding pixels added to each side before square ROI crop. Overrides --bbox-padding when set.",
+    )
     parser.add_argument("--crop-size", type=int, default=256)
     parser.add_argument("--decode-method", choices=["argmax", "subpixel"], default="subpixel")
     parser.add_argument("--subpixel-window", type=int, default=5)
@@ -86,10 +92,13 @@ def load_bboxes(args: argparse.Namespace) -> List[BBox]:
     return bboxes
 
 
-def make_square_crop_box(box: BBox, padding_ratio: float) -> BBox:
+def make_square_crop_box(box: BBox, padding_ratio: float, padding_pixels: Optional[float] = None) -> BBox:
     x1, y1, x2, y2 = box
     w, h = x2 - x1, y2 - y1
-    side = max(w, h) * (1.0 + 2.0 * padding_ratio)
+    if padding_pixels is not None:
+        side = max(w, h) + 2.0 * padding_pixels
+    else:
+        side = max(w, h) * (1.0 + 2.0 * padding_ratio)
     cx, cy = (x1 + x2) * 0.5, (y1 + y2) * 0.5
     half = side * 0.5
     return cx - half, cy - half, cx + half, cy + half
@@ -157,6 +166,10 @@ def draw_prediction(canvas: Image.Image, bbox: BBox, crop_box: BBox, corners: np
 @torch.no_grad()
 def main() -> None:
     args = parse_args()
+    if args.bbox_padding < 0:
+        raise ValueError("--bbox-padding must be non-negative.")
+    if args.bbox_padding_pixels is not None and args.bbox_padding_pixels < 0:
+        raise ValueError("--bbox-padding-pixels must be non-negative.")
     device = torch.device(args.device)
     bboxes = load_bboxes(args)
 
@@ -167,7 +180,7 @@ def main() -> None:
     canvas = image.copy()
     predictions: List[Dict[str, Any]] = []
     for inst_idx, bbox in enumerate(bboxes):
-        crop_box = make_square_crop_box(bbox, args.bbox_padding)
+        crop_box = make_square_crop_box(bbox, args.bbox_padding, args.bbox_padding_pixels)
         crop = crop_with_padding(image, crop_box, args.crop_size)
         tensor = preprocess(crop).to(device)
 
@@ -204,6 +217,7 @@ def main() -> None:
                 "image": str(args.image),
                 "checkpoint": str(args.checkpoint),
                 "bbox_padding": args.bbox_padding,
+                "bbox_padding_pixels": args.bbox_padding_pixels,
                 "crop_size": args.crop_size,
                 "decode_method": args.decode_method,
                 "subpixel_window": args.subpixel_window,

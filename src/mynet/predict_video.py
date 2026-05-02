@@ -44,7 +44,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--conf", type=float, default=0.25)
     parser.add_argument("--iou", type=float, default=0.7)
     parser.add_argument("--max-detections", type=int, default=2)
-    parser.add_argument("--bbox-padding", type=float, default=0.25)
+    parser.add_argument("--bbox-padding", type=float, default=0.10)
+    parser.add_argument(
+        "--bbox-padding-pixels",
+        type=float,
+        default=None,
+        help="Absolute padding pixels added to each side before square ROI crop. Overrides --bbox-padding when set.",
+    )
     parser.add_argument("--crop-size", type=int, default=256)
     parser.add_argument("--decode-method", choices=["argmax", "subpixel"], default="subpixel")
     parser.add_argument("--subpixel-window", type=int, default=5)
@@ -206,7 +212,7 @@ def run_mynet_on_detections(
     tensors = []
     for det in detections:
         bbox = tuple(float(v) for v in det["bbox_xyxy_full"])
-        crop_box = make_square_crop_box(bbox, args.bbox_padding)
+        crop_box = make_square_crop_box(bbox, args.bbox_padding, args.bbox_padding_pixels)
         crop = crop_with_padding(frame_rgb, crop_box, args.crop_size)
         crops.append(crop)
         crop_boxes.append(crop_box)
@@ -502,6 +508,10 @@ def process_video(args: argparse.Namespace) -> None:
         raise FileNotFoundError(f"MyNet checkpoint not found: {args.mynet_checkpoint}")
     if args.max_detections <= 0:
         raise ValueError("--max-detections must be positive.")
+    if args.bbox_padding < 0:
+        raise ValueError("--bbox-padding must be non-negative.")
+    if args.bbox_padding_pixels is not None and args.bbox_padding_pixels < 0:
+        raise ValueError("--bbox-padding-pixels must be non-negative.")
     if args.debug_every <= 0:
         raise ValueError("--debug-every must be positive.")
     if not 0.0 <= args.corner_score_threshold <= 1.0:
