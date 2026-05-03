@@ -14,6 +14,105 @@ IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(3,
 IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(3, 1, 1)
 
 
+def build_image_augmentation(strength: str = "medium", probability: float = 0.8) -> Optional[Any]:
+    if probability <= 0:
+        return None
+    if probability > 1:
+        raise ValueError("--image-aug-prob must be in [0, 1].")
+
+    try:
+        import albumentations as A
+    except ImportError as exc:
+        raise RuntimeError("Image augmentation requires albumentations. Run: uv pip install albumentations") from exc
+
+    configs = {
+        "light": {
+            "brightness": 0.12,
+            "contrast": 0.12,
+            "gamma": (85, 120),
+            "hue": 4,
+            "sat": 12,
+            "val": 8,
+            "noise_std": (0.01, 0.04),
+            "quality": (65, 98),
+            "blur_limit": (3, 3),
+            "defocus_radius": (2, 3),
+            "noise_p": 0.18,
+            "compression_p": 0.20,
+            "blur_p": 0.12,
+        },
+        "medium": {
+            "brightness": 0.20,
+            "contrast": 0.20,
+            "gamma": (75, 130),
+            "hue": 6,
+            "sat": 20,
+            "val": 12,
+            "noise_std": (0.02, 0.08),
+            "quality": (45, 95),
+            "blur_limit": (3, 5),
+            "defocus_radius": (2, 4),
+            "noise_p": 0.25,
+            "compression_p": 0.30,
+            "blur_p": 0.20,
+        },
+        "strong": {
+            "brightness": 0.28,
+            "contrast": 0.28,
+            "gamma": (65, 145),
+            "hue": 8,
+            "sat": 30,
+            "val": 18,
+            "noise_std": (0.04, 0.14),
+            "quality": (30, 92),
+            "blur_limit": (3, 7),
+            "defocus_radius": (2, 5),
+            "noise_p": 0.35,
+            "compression_p": 0.40,
+            "blur_p": 0.28,
+        },
+    }
+    if strength not in configs:
+        raise ValueError("--image-aug-strength must be one of: light, medium, strong.")
+
+    cfg = configs[strength]
+    return A.Compose(
+        [
+            A.RandomBrightnessContrast(
+                brightness_limit=cfg["brightness"],
+                contrast_limit=cfg["contrast"],
+                p=0.45,
+            ),
+            A.RandomGamma(gamma_limit=cfg["gamma"], p=0.25),
+            A.HueSaturationValue(
+                hue_shift_limit=cfg["hue"],
+                sat_shift_limit=cfg["sat"],
+                val_shift_limit=cfg["val"],
+                p=0.25,
+            ),
+            A.OneOf(
+                [
+                    A.GaussNoise(std_range=cfg["noise_std"], mean_range=(0.0, 0.0), per_channel=True, p=1.0),
+                    A.ISONoise(color_shift=(0.01, 0.04), intensity=(0.08, 0.35), p=1.0),
+                ],
+                p=cfg["noise_p"],
+            ),
+            A.ImageCompression(compression_type="jpeg", quality_range=cfg["quality"], p=cfg["compression_p"]),
+            A.OneOf(
+                [
+                    A.MotionBlur(blur_limit=cfg["blur_limit"], p=1.0),
+                    A.Defocus(radius=cfg["defocus_radius"], alias_blur=(0.1, 0.35), p=1.0),
+                    A.GaussianBlur(blur_limit=cfg["blur_limit"], sigma_limit=(0.2, 1.2), p=1.0),
+                ],
+                p=cfg["blur_p"],
+            ),
+            A.Sharpen(alpha=(0.08, 0.25), lightness=(0.8, 1.2), p=0.10),
+            A.CLAHE(clip_limit=(1.0, 2.0), tile_grid_size=(8, 8), p=0.08),
+        ],
+        p=probability,
+    )
+
+
 def _load_json(path: Path) -> Any:
     with path.open("r", encoding="utf-8") as f:
         return json.load(f)
@@ -50,11 +149,15 @@ class BOPCornerDataset(Dataset):
         index_path: str | Path,
         dataset_root: str | Path | None = None,
         normalize: bool = True,
+        image_aug: bool = False,
+        image_aug_strength: str = "medium",
+        image_aug_prob: float = 0.8,
     ) -> None:
         self.index_path = Path(index_path)
         self.dataset_root = Path(dataset_root) if dataset_root is not None else None
         self.samples: List[Dict[str, Any]] = _load_json(self.index_path)
         self.normalize = normalize
+        self.image_aug = build_image_augmentation(image_aug_strength, image_aug_prob) if image_aug else None
 
         if not isinstance(self.samples, list):
             raise ValueError(f"Index must contain a list of samples: {self.index_path}")
@@ -69,7 +172,10 @@ class BOPCornerDataset(Dataset):
         if crop_path is None or heatmap_path is None:
             raise FileNotFoundError(f"Missing crop or heatmap path for sample {sample.get('sample_id', idx)}")
 
-        image_np = np.asarray(Image.open(crop_path).convert("RGB"), dtype=np.float32) / 255.0
+        image_np_u8 = np.asarray(Image.open(crop_path).convert("RGB"), dtype=np.uint8)
+        if self.image_aug is not None:
+            image_np_u8 = self.image_aug(image=image_np_u8)["image"]
+        image_np = image_np_u8.astype(np.float32) / 255.0
         image = torch.from_numpy(image_np).permute(2, 0, 1).contiguous()
         if self.normalize:
             image = (image - IMAGENET_MEAN) / IMAGENET_STD

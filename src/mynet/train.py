@@ -36,11 +36,29 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save-every", type=int, default=10)
     parser.add_argument("--tensorboard", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--log-dir", type=Path, default=None)
+    parser.add_argument("--image-aug", action=argparse.BooleanOptionalAction, default=False, help="Enable train-only photometric augmentation.")
+    parser.add_argument("--image-aug-strength", choices=["light", "medium", "strong"], default="medium")
+    parser.add_argument("--image-aug-prob", type=float, default=0.8)
     return parser.parse_args()
 
 
-def make_loader(index_path: Path, data_root: Path, batch_size: int, num_workers: int, shuffle: bool) -> DataLoader:
-    dataset = BOPCornerDataset(index_path=index_path, dataset_root=data_root)
+def make_loader(
+    index_path: Path,
+    data_root: Path,
+    batch_size: int,
+    num_workers: int,
+    shuffle: bool,
+    image_aug: bool = False,
+    image_aug_strength: str = "medium",
+    image_aug_prob: float = 0.8,
+) -> DataLoader:
+    dataset = BOPCornerDataset(
+        index_path=index_path,
+        dataset_root=data_root,
+        image_aug=image_aug,
+        image_aug_strength=image_aug_strength,
+        image_aug_prob=image_aug_prob,
+    )
     return DataLoader(
         dataset,
         batch_size=batch_size,
@@ -175,14 +193,25 @@ def append_metrics_jsonl(path: Path, record: Dict[str, object]) -> None:
 
 def main() -> None:
     args = parse_args()
+    if not 0.0 <= args.image_aug_prob <= 1.0:
+        raise ValueError("--image-aug-prob must be in [0, 1].")
     args.train_index = args.train_index or (args.data_root / "train.json")
     args.val_index = args.val_index or (args.data_root / "val.json")
     device = torch.device(args.device)
 
-    train_loader = make_loader(args.train_index, args.data_root, args.batch_size, args.num_workers, shuffle=True)
+    train_loader = make_loader(
+        args.train_index,
+        args.data_root,
+        args.batch_size,
+        args.num_workers,
+        shuffle=True,
+        image_aug=args.image_aug,
+        image_aug_strength=args.image_aug_strength,
+        image_aug_prob=args.image_aug_prob,
+    )
     val_loader = None
     if args.val_index.exists():
-        val_dataset = BOPCornerDataset(args.val_index, dataset_root=args.data_root)
+        val_dataset = BOPCornerDataset(args.val_index, dataset_root=args.data_root, image_aug=False)
         if len(val_dataset) > 0:
             val_loader = DataLoader(
                 val_dataset,
@@ -213,6 +242,8 @@ def main() -> None:
         if writer is not None:
             writer.add_scalar("train/loss_epoch", train_metrics["loss"], epoch)
             writer.add_scalar("train/valid_corner_ratio_epoch", train_metrics["valid_corner_ratio"], epoch)
+            writer.add_scalar("train/image_aug_enabled", 1.0 if args.image_aug else 0.0, epoch)
+            writer.add_scalar("train/image_aug_prob", float(args.image_aug_prob) if args.image_aug else 0.0, epoch)
             for key, value in val_metrics.items():
                 writer.add_scalar(f"val/{key}", value, epoch)
             writer.flush()
