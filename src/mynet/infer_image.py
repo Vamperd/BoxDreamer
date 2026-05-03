@@ -9,7 +9,7 @@ import numpy as np
 import torch
 from PIL import Image, ImageDraw
 
-from src.mynet.dataset import IMAGENET_MEAN, IMAGENET_STD
+from src.mynet.dataset import IMAGENET_MEAN, IMAGENET_STD, INPUT_MODE_FIXED, INPUT_MODE_RECT_DYNAMIC, clip_bbox_to_image
 from src.mynet.decode import decode_heatmap
 
 
@@ -43,6 +43,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--bbox-json", type=Path, default=None, help="Optional JSON containing a list of bboxes or {'bboxes': [...]}.")
     parser.add_argument("--min-bboxes", type=int, default=1, help="Minimum number of bboxes to run.")
     parser.add_argument("--max-bboxes", type=int, default=2, help="Maximum number of bboxes to run.")
+    parser.add_argument("--input-mode", choices=["auto", "fixed", "rect_dynamic"], default="auto")
     parser.add_argument("--bbox-padding", type=float, default=0.10, help="Padding ratio applied before square ROI crop.")
     parser.add_argument(
         "--bbox-padding-pixels",
@@ -119,10 +120,23 @@ def crop_with_padding(image: Image.Image, crop_box: BBox, crop_size: int) -> Ima
     )
 
 
-def crop_to_full(points: np.ndarray, crop_box: BBox, crop_size: int) -> np.ndarray:
-    x1, y1, x2, _ = crop_box
-    side = x2 - x1
+def crop_rect(image: Image.Image, bbox: BBox) -> Tuple[Image.Image, BBox]:
+    crop_box = clip_bbox_to_image(bbox, image.size)
+    if crop_box is None:
+        raise ValueError(f"Invalid bbox after clipping to image bounds: {bbox}")
+    left, top, right, bottom = [int(v) for v in crop_box]
+    return image.crop((left, top, right, bottom)), crop_box
+
+
+def crop_to_full(points: np.ndarray, crop_box: BBox, crop_size: Optional[int] = None) -> np.ndarray:
+    x1, y1, x2, y2 = crop_box
     out = np.empty_like(points, dtype=np.float32)
+    if crop_size is None:
+        out[:, 0] = x1 + points[:, 0]
+        out[:, 1] = y1 + points[:, 1]
+        return out
+
+    side = x2 - x1
     out[:, 0] = x1 + points[:, 0] * side / crop_size
     out[:, 1] = y1 + points[:, 1] * side / crop_size
     return out
@@ -142,6 +156,8 @@ def load_model(checkpoint_path: Path, device: torch.device) -> torch.nn.Module:
     state_dict = checkpoint["model"] if isinstance(checkpoint, dict) and "model" in checkpoint else checkpoint
     model = CornerResNet34(out_channels=8, pretrained=False)
     model.load_state_dict(state_dict)
+    args = checkpoint.get("args", {}) if isinstance(checkpoint, dict) else {}
+    model.input_mode = str(args.get("input_mode", INPUT_MODE_FIXED))
     model.to(device)
     model.eval()
     return model
@@ -176,24 +192,30 @@ def main() -> None:
     args.output_dir.mkdir(parents=True, exist_ok=True)
     image = Image.open(args.image).convert("RGB")
     model = load_model(args.checkpoint, device)
+    input_mode = getattr(model, "input_mode", INPUT_MODE_FIXED) if args.input_mode == "auto" else args.input_mode
 
     canvas = image.copy()
     predictions: List[Dict[str, Any]] = []
     for inst_idx, bbox in enumerate(bboxes):
-        crop_box = make_square_crop_box(bbox, args.bbox_padding, args.bbox_padding_pixels)
-        crop = crop_with_padding(image, crop_box, args.crop_size)
+        if input_mode == INPUT_MODE_RECT_DYNAMIC:
+            crop, crop_box = crop_rect(image, bbox)
+        else:
+            crop_box = make_square_crop_box(bbox, args.bbox_padding, args.bbox_padding_pixels)
+            crop = crop_with_padding(image, crop_box, args.crop_size)
         tensor = preprocess(crop).to(device)
 
         logits = model(tensor)
+        crop_hw = torch.tensor([[crop.height, crop.width]], device=device, dtype=torch.float32) if input_mode == INPUT_MODE_RECT_DYNAMIC else None
         corners_crop = decode_heatmap(
             logits,
             crop_size=args.crop_size,
+            crop_hw=crop_hw,
             decode_method=args.decode_method,
             subpixel_window=args.subpixel_window,
         )[0].cpu().numpy()
         probs = torch.sigmoid(logits).flatten(2)
         scores = probs.max(dim=2).values[0].cpu().numpy().astype(float)
-        corners_full = crop_to_full(corners_crop, crop_box, args.crop_size)
+        corners_full = crop_to_full(corners_crop, crop_box, None if input_mode == INPUT_MODE_RECT_DYNAMIC else args.crop_size)
 
         draw_prediction(canvas, bbox, crop_box, corners_full, scores, inst_idx)
         if args.save_crops:
@@ -216,6 +238,7 @@ def main() -> None:
             {
                 "image": str(args.image),
                 "checkpoint": str(args.checkpoint),
+                "input_mode": input_mode,
                 "bbox_padding": args.bbox_padding,
                 "bbox_padding_pixels": args.bbox_padding_pixels,
                 "crop_size": args.crop_size,

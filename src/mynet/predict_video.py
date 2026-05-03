@@ -9,8 +9,9 @@ import numpy as np
 import torch
 from PIL import Image, ImageDraw
 
+from src.mynet.dataset import INPUT_MODE_FIXED, INPUT_MODE_RECT_DYNAMIC
 from src.mynet.decode import decode_heatmap
-from src.mynet.infer_image import crop_to_full, crop_with_padding, load_model, make_square_crop_box, preprocess
+from src.mynet.infer_image import crop_rect, crop_to_full, crop_with_padding, load_model, make_square_crop_box, preprocess
 
 
 BBox = Tuple[float, float, float, float]
@@ -44,6 +45,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--conf", type=float, default=0.25)
     parser.add_argument("--iou", type=float, default=0.7)
     parser.add_argument("--max-detections", type=int, default=2)
+    parser.add_argument("--input-mode", choices=["auto", "fixed", "rect_dynamic"], default="auto")
     parser.add_argument("--bbox-padding", type=float, default=0.10)
     parser.add_argument(
         "--bbox-padding-pixels",
@@ -172,13 +174,53 @@ def run_mynet_on_detections(
     detections: Sequence[Dict[str, Any]],
     device: torch.device,
     args: argparse.Namespace,
-) -> tuple[List[Dict[str, Any]], List[Image.Image], np.ndarray]:
+) -> tuple[List[Dict[str, Any]], List[Image.Image], List[np.ndarray]]:
     if not detections:
-        return [], [], np.zeros((0, 8, 1, 1), dtype=np.float32)
+        return [], [], []
 
     frame_rgb = frame_to_pil_rgb(cv2, frame_bgr)
     crops: List[Image.Image] = []
     crop_boxes: List[BBox] = []
+    heatmaps_list: List[np.ndarray] = []
+    use_amp = args.amp and device.type == "cuda"
+    predictions: List[Dict[str, Any]] = []
+
+    if args.input_mode == INPUT_MODE_RECT_DYNAMIC:
+        for idx, det in enumerate(detections):
+            bbox = tuple(float(v) for v in det["bbox_xyxy_full"])
+            try:
+                crop, crop_box = crop_rect(frame_rgb, bbox)
+            except ValueError:
+                continue
+            crops.append(crop)
+            crop_boxes.append(crop_box)
+            tensor = preprocess(crop).to(device)
+            with torch.no_grad(), torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
+                logits = mynet(tensor)
+            crop_hw = torch.tensor([[crop.height, crop.width]], device=device, dtype=torch.float32)
+            corners_crop = decode_heatmap(
+                logits,
+                crop_size=args.crop_size,
+                crop_hw=crop_hw,
+                decode_method=args.decode_method,
+                subpixel_window=args.subpixel_window,
+            )[0].detach().cpu().numpy()
+            heatmaps = torch.sigmoid(logits).detach().cpu().numpy().astype(np.float32)[0]
+            scores = heatmaps.reshape(heatmaps.shape[0], -1).max(axis=1)
+            heatmaps_list.append(heatmaps)
+            corners_full = crop_to_full(corners_crop.astype(np.float32), crop_box, None)
+            predictions.append(
+                {
+                    "instance_id": int(det["instance_id"]),
+                    "crop_box_xyxy_full": [float(v) for v in crop_box],
+                    "crop_size_hw": [int(crop.height), int(crop.width)],
+                    "corners_2d_crop": corners_crop.astype(float).tolist(),
+                    "corners_2d_full": corners_full.astype(float).tolist(),
+                    "corner_scores": [float(v) for v in scores],
+                }
+            )
+        return predictions, crops, heatmaps_list
+
     tensors = []
     for det in detections:
         bbox = tuple(float(v) for v in det["bbox_xyxy_full"])
@@ -189,7 +231,6 @@ def run_mynet_on_detections(
         tensors.append(preprocess(crop))
 
     batch = torch.cat(tensors, dim=0).to(device)
-    use_amp = args.amp and device.type == "cuda"
     with torch.no_grad(), torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
         logits = mynet(batch)
 
@@ -202,19 +243,20 @@ def run_mynet_on_detections(
     heatmaps_batch = torch.sigmoid(logits).detach().cpu().numpy().astype(np.float32)
     scores_batch = heatmaps_batch.reshape(heatmaps_batch.shape[0], heatmaps_batch.shape[1], -1).max(axis=2)
 
-    predictions: List[Dict[str, Any]] = []
     for idx, (corners_crop, scores, crop_box) in enumerate(zip(corners_crop_batch, scores_batch, crop_boxes)):
         corners_full = crop_to_full(corners_crop.astype(np.float32), crop_box, args.crop_size)
+        heatmaps_list.append(heatmaps_batch[idx])
         predictions.append(
             {
                 "instance_id": int(detections[idx]["instance_id"]),
                 "crop_box_xyxy_full": [float(v) for v in crop_box],
+                "crop_size_hw": [int(crops[idx].height), int(crops[idx].width)],
                 "corners_2d_crop": corners_crop.astype(float).tolist(),
                 "corners_2d_full": corners_full.astype(float).tolist(),
                 "corner_scores": [float(v) for v in scores],
             }
         )
-    return predictions, crops, heatmaps_batch
+    return predictions, crops, heatmaps_list
 
 
 def detection_color(det: Dict[str, Any]) -> Tuple[int, int, int]:
@@ -325,7 +367,7 @@ def save_debug_images(
     bbox_frame: np.ndarray,
     crops: Sequence[Image.Image],
     corner_predictions: Sequence[Dict[str, Any]],
-    heatmaps: np.ndarray,
+    heatmaps: Sequence[np.ndarray],
     final_frame: np.ndarray,
 ) -> None:
     debug_root = out_dir / "debug"
@@ -390,6 +432,8 @@ def process_video(args: argparse.Namespace) -> None:
     detector = load_detector(args.detector_weights)
     mynet_device = torch.device(args.mynet_device)
     mynet = load_model(args.mynet_checkpoint, mynet_device)
+    if args.input_mode == "auto":
+        args.input_mode = getattr(mynet, "input_mode", INPUT_MODE_FIXED)
     annotation_lookup = load_annotation_lookup(args.annotations_json) if args.fallback_to_annotations else {}
 
     cap = cv2.VideoCapture(str(args.video))

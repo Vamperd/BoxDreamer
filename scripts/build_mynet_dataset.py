@@ -12,7 +12,10 @@ This script reads the existing `dji-action4` layout:
         scene_gt.json
         scene_gt_info.json
 
-and writes the MyNet training layout described in plan.md:
+and writes the MyNet training layout described in plan.md. The default
+`fixed` mode writes pre-rendered square crops/heatmaps, while
+`rect_dynamic` writes only metadata so the dataset can crop tight
+rectangular ROIs online:
 
     data/dji_action4_mynet/
       meta.json
@@ -50,6 +53,7 @@ class BuildConfig:
     output_root: Path
     corners_meta: Optional[Path]
     obj_id: int
+    input_mode: str
     crop_size: int
     heatmap_size: int
     sigma: float
@@ -269,6 +273,18 @@ def make_square_crop_box(
     return cx - half, cy - half, cx + half, cy + half
 
 
+def clip_bbox_to_image(box: BBox, image_size: Tuple[int, int]) -> Optional[BBox]:
+    width, height = image_size
+    x1, y1, x2, y2 = box
+    left = max(0, min(width, int(math.floor(x1))))
+    top = max(0, min(height, int(math.floor(y1))))
+    right = max(0, min(width, int(math.ceil(x2))))
+    bottom = max(0, min(height, int(math.ceil(y2))))
+    if right <= left or bottom <= top:
+        return None
+    return float(left), float(top), float(right), float(bottom)
+
+
 def crop_with_padding(image: Image.Image, crop_box: BBox, crop_size: int) -> Image.Image:
     """Crop a possibly out-of-image square box and resize to crop_size."""
     src = np.asarray(image.convert("RGB"))
@@ -297,6 +313,14 @@ def full_to_crop(points: np.ndarray, crop_box: BBox, crop_size: int) -> np.ndarr
     return out
 
 
+def full_to_rect_crop(points: np.ndarray, crop_box: BBox) -> np.ndarray:
+    x1, y1, _, _ = crop_box
+    out = np.empty_like(points, dtype=np.float32)
+    out[:, 0] = points[:, 0] - x1
+    out[:, 1] = points[:, 1] - y1
+    return out
+
+
 def make_heatmaps(
     corners_crop: np.ndarray,
     corner_visible: Sequence[int],
@@ -313,6 +337,34 @@ def make_heatmaps(
         x_hm = float(point[0] * scale)
         y_hm = float(point[1] * scale)
         is_valid = bool(corner_visible[idx]) and 0 <= x_hm < heatmap_size and 0 <= y_hm < heatmap_size
+        valid.append(1 if is_valid else 0)
+        if not is_valid:
+            continue
+        heatmaps[idx] = np.exp(-((xx - x_hm) ** 2 + (yy - y_hm) ** 2) / (2.0 * sigma**2))
+
+    return heatmaps, valid
+
+
+def make_rect_heatmaps(
+    corners_crop: np.ndarray,
+    corner_visible: Sequence[int],
+    crop_hw: Tuple[int, int],
+    sigma: float,
+    output_stride: int = 4,
+) -> Tuple[np.ndarray, List[int]]:
+    crop_h, crop_w = crop_hw
+    heatmap_h = max(1, int(math.ceil(crop_h / float(output_stride))))
+    heatmap_w = max(1, int(math.ceil(crop_w / float(output_stride))))
+    heatmaps = np.zeros((8, heatmap_h, heatmap_w), dtype=np.float32)
+    valid: List[int] = []
+    yy, xx = np.mgrid[0:heatmap_h, 0:heatmap_w].astype(np.float32)
+    scale_x = heatmap_w / float(max(1, crop_w))
+    scale_y = heatmap_h / float(max(1, crop_h))
+
+    for idx, point in enumerate(corners_crop):
+        x_hm = float(point[0] * scale_x)
+        y_hm = float(point[1] * scale_y)
+        is_valid = bool(corner_visible[idx]) and 0 <= point[0] < crop_w and 0 <= point[1] < crop_h and 0 <= x_hm < heatmap_w and 0 <= y_hm < heatmap_h
         valid.append(1 if is_valid else 0)
         if not is_valid:
             continue
@@ -500,20 +552,33 @@ def build_dataset(cfg: BuildConfig) -> Dict[str, int]:
                     skipped += 1
                     continue
 
-                crop_box = make_square_crop_box(base_bbox, (image_w, image_h), cfg.padding_ratio, cfg.padding_pixels)
-                crop_img = crop_with_padding(image, crop_box, cfg.crop_size)
-                corners_2d_crop = full_to_crop(corners_2d_full, crop_box, cfg.crop_size)
-                heatmaps, corner_valid = make_heatmaps(corners_2d_crop, corner_visible, cfg.crop_size, cfg.heatmap_size, cfg.sigma)
+                if cfg.input_mode == "rect_dynamic":
+                    crop_box = clip_bbox_to_image(base_bbox, (image_w, image_h))
+                    if not valid_bbox(crop_box):
+                        skipped += 1
+                        continue
+                    left, top, right, bottom = [int(v) for v in crop_box]
+                    crop_img = image.crop((left, top, right, bottom))
+                    crop_w, crop_h = crop_img.size
+                    corners_2d_crop = full_to_rect_crop(corners_2d_full, crop_box)
+                    heatmaps, corner_valid = make_rect_heatmaps(corners_2d_crop, corner_visible, (crop_h, crop_w), cfg.sigma)
+                else:
+                    crop_box = make_square_crop_box(base_bbox, (image_w, image_h), cfg.padding_ratio, cfg.padding_pixels)
+                    crop_img = crop_with_padding(image, crop_box, cfg.crop_size)
+                    crop_w, crop_h = crop_img.size
+                    corners_2d_crop = full_to_crop(corners_2d_full, crop_box, cfg.crop_size)
+                    heatmaps, corner_valid = make_heatmaps(corners_2d_crop, corner_visible, cfg.crop_size, cfg.heatmap_size, cfg.sigma)
 
                 sample_id = f"{scene_id}_{int(image_id):06d}_{inst_idx:06d}"
                 crop_path = cfg.output_root / "crops" / split / f"{sample_id}.png"
                 heatmap_path = cfg.output_root / "heatmaps" / split / f"{sample_id}.npy"
                 debug_path = cfg.output_root / "debug_vis" / split / f"{sample_id}.jpg"
 
-                crop_path.parent.mkdir(parents=True, exist_ok=True)
-                heatmap_path.parent.mkdir(parents=True, exist_ok=True)
-                crop_img.save(crop_path)
-                np.save(heatmap_path, heatmaps)
+                if cfg.input_mode != "rect_dynamic":
+                    crop_path.parent.mkdir(parents=True, exist_ok=True)
+                    heatmap_path.parent.mkdir(parents=True, exist_ok=True)
+                    crop_img.save(crop_path)
+                    np.save(heatmap_path, heatmaps)
 
                 if debug_counts[split] < cfg.debug_vis_limit:
                     debug_path.parent.mkdir(parents=True, exist_ok=True)
@@ -531,8 +596,9 @@ def build_dataset(cfg: BuildConfig) -> Dict[str, int]:
                     "instance_idx": inst_idx,
                     "rgb_path": path_for_json(rgb_path, repo_root),
                     "mask_path": path_for_json(mask_path, repo_root) if mask_path.exists() else None,
-                    "crop_path": path_for_json(crop_path, repo_root),
-                    "heatmap_path": path_for_json(heatmap_path, repo_root),
+                    "crop_path": None if cfg.input_mode == "rect_dynamic" else path_for_json(crop_path, repo_root),
+                    "heatmap_path": None if cfg.input_mode == "rect_dynamic" else path_for_json(heatmap_path, repo_root),
+                    "input_mode": cfg.input_mode,
                     "obj_id": cfg.obj_id,
                     "K": K.tolist(),
                     "R": R.tolist(),
@@ -540,8 +606,8 @@ def build_dataset(cfg: BuildConfig) -> Dict[str, int]:
                     "bbox_source": bbox_source,
                     "bbox_xyxy_full": [float(v) for v in base_bbox],
                     "crop_box_xyxy_full": [float(v) for v in crop_box],
-                    "crop_padding_ratio": cfg.padding_ratio,
-                    "crop_padding_pixels": cfg.padding_pixels,
+                    "crop_padding_ratio": None if cfg.input_mode == "rect_dynamic" else cfg.padding_ratio,
+                    "crop_padding_pixels": None if cfg.input_mode == "rect_dynamic" else cfg.padding_pixels,
                     "corners_3d": corners_3d.tolist(),
                     "corners_2d_full": corners_2d_full.tolist(),
                     "corners_2d_crop": corners_2d_crop.tolist(),
@@ -553,6 +619,8 @@ def build_dataset(cfg: BuildConfig) -> Dict[str, int]:
                     "visib_fract": float(info.get("visib_fract", 1.0)),
                     "px_count_visib": int(info.get("px_count_visib", 0)),
                     "image_size_full": [image_w, image_h],
+                    "crop_size_hw": [int(crop_h), int(crop_w)],
+                    "heatmap_size_hw": [int(heatmaps.shape[1]), int(heatmaps.shape[2])],
                     "crop_size": cfg.crop_size,
                     "heatmap_size": cfg.heatmap_size,
                 }
@@ -581,11 +649,12 @@ def build_dataset(cfg: BuildConfig) -> Dict[str, int]:
             "max_x,min_y,max_z",
         ],
         "corners_3d": corners_3d.tolist(),
+        "input_mode": cfg.input_mode,
         "crop_size": cfg.crop_size,
         "heatmap_size": cfg.heatmap_size,
         "sigma": cfg.sigma,
-        "crop_padding_ratio": cfg.padding_ratio,
-        "crop_padding_pixels": cfg.padding_pixels,
+        "crop_padding_ratio": None if cfg.input_mode == "rect_dynamic" else cfg.padding_ratio,
+        "crop_padding_pixels": None if cfg.input_mode == "rect_dynamic" else cfg.padding_pixels,
         "bbox_source": cfg.bbox_source,
         "corner_visibility_source": cfg.corner_visibility_source,
         "min_visib_fract": cfg.min_visib_fract,
@@ -612,6 +681,12 @@ def parse_args() -> BuildConfig:
     parser.add_argument("--output-root", type=Path, default=Path("data/dji_action4_mynet"), help="Output MyNet dataset root.")
     parser.add_argument("--corners-meta", type=Path, default=None, help="Optional MyNet meta.json containing corners_3d.")
     parser.add_argument("--obj-id", type=int, default=1)
+    parser.add_argument(
+        "--input-mode",
+        choices=["fixed", "rect_dynamic"],
+        default="fixed",
+        help="fixed writes 256 square crops/heatmaps; rect_dynamic writes only rectangular ROI metadata for online crop generation.",
+    )
     parser.add_argument("--crop-size", type=int, default=256)
     parser.add_argument("--heatmap-size", type=int, default=64)
     parser.add_argument("--sigma", type=float, default=2.0)
@@ -651,6 +726,7 @@ def parse_args() -> BuildConfig:
         output_root=args.output_root,
         corners_meta=args.corners_meta,
         obj_id=args.obj_id,
+        input_mode=args.input_mode,
         crop_size=args.crop_size,
         heatmap_size=args.heatmap_size,
         sigma=args.sigma,

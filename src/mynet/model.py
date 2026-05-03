@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 from torchvision import models
 
 
@@ -14,10 +15,10 @@ def _build_resnet34(pretrained: bool) -> nn.Module:
 
 
 class CornerResNet34(nn.Module):
-    """ResNet34 backbone with a stride-4 heatmap head.
+    """ResNet34 backbone with a dynamic stride-4 heatmap head.
 
-    Input:  [B, 3, 256, 256]
-    Output: [B, 8, 64, 64] logits
+    Input:  [B, 3, H, W]
+    Output: [B, 8, H_out, W_out] logits, aligned to the layer1 feature map.
     """
 
     def __init__(self, out_channels: int = 8, pretrained: bool = True) -> None:
@@ -57,6 +58,14 @@ class CornerResNet34(nn.Module):
             nn.ReLU(inplace=True),
         )
 
+    @staticmethod
+    def _resize_and_apply(x: torch.Tensor, target: torch.Tensor, block: nn.Sequential) -> torch.Tensor:
+        x = F.interpolate(x, size=target.shape[-2:], mode="bilinear", align_corners=False)
+        # Keep the old Sequential layout so fixed-size checkpoints still load.
+        for layer in list(block.children())[1:]:
+            x = layer(x)
+        return x
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x0 = self.stem(x)
         c1 = self.layer1(x0)
@@ -64,9 +73,8 @@ class CornerResNet34(nn.Module):
         c3 = self.layer3(c2)
         c4 = self.layer4(c3)
 
-        x = self.up4(c4)
-        x = self.up3(torch.cat([x, c3], dim=1))
-        x = self.up2(torch.cat([x, c2], dim=1))
+        x = self._resize_and_apply(c4, c3, self.up4)
+        x = self._resize_and_apply(torch.cat([x, c3], dim=1), c2, self.up3)
+        x = self._resize_and_apply(torch.cat([x, c2], dim=1), c1, self.up2)
         logits = self.refine(torch.cat([x, c1], dim=1))
         return logits
-

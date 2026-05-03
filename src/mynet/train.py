@@ -9,7 +9,7 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader
 
-from src.mynet.dataset import BOPCornerDataset, collate_corner_batch
+from src.mynet.dataset import BOPCornerDataset, INPUT_MODE_RECT_DYNAMIC, collate_corner_batch
 from src.mynet.decode import corner_metrics
 from src.mynet.losses import corner_loss
 
@@ -25,11 +25,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-workers", type=int, default=8)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument("--input-mode", choices=["auto", "fixed", "rect_dynamic"], default="auto")
     parser.add_argument("--crop-size", type=int, default=256)
+    parser.add_argument("--sigma", type=float, default=2.0)
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=None)
     parser.add_argument("--decode-method", choices=["argmax", "subpixel"], default="subpixel")
     parser.add_argument("--subpixel-window", type=int, default=5)
     parser.add_argument("--invisible-peak-threshold", type=float, default=0.3)
     parser.add_argument("--pretrained", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--freeze-bn", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--log-every", type=int, default=20)
@@ -39,14 +43,13 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def make_loader(index_path: Path, data_root: Path, batch_size: int, num_workers: int, shuffle: bool) -> DataLoader:
-    dataset = BOPCornerDataset(index_path=index_path, dataset_root=data_root)
+def make_loader(dataset: BOPCornerDataset, batch_size: int, num_workers: int, shuffle: bool, device: torch.device) -> DataLoader:
     return DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=shuffle,
         num_workers=num_workers,
-        pin_memory=True,
+        pin_memory=device.type == "cuda",
         drop_last=False,
         collate_fn=collate_corner_batch,
     )
@@ -67,6 +70,17 @@ def aggregate(values: Iterable[Dict[str, float]]) -> Dict[str, float]:
     return {key: sum(item[key] for item in values) / len(values) for key in keys}
 
 
+def set_batchnorm_eval(model: nn.Module) -> None:
+    for module in model.modules():
+        if isinstance(module, nn.BatchNorm2d):
+            module.eval()
+
+
+def compute_loss(logits: torch.Tensor, batch: Dict[str, object], args: argparse.Namespace) -> Dict[str, torch.Tensor]:
+    corner_valid = batch["corner_valid"] if args.input_mode == INPUT_MODE_RECT_DYNAMIC else None
+    return corner_loss(logits, batch["heatmap"], corner_valid=corner_valid)
+
+
 def train_one_epoch(
     model: nn.Module,
     loader: DataLoader,
@@ -79,21 +93,26 @@ def train_one_epoch(
     global_step: int = 0,
 ) -> tuple[Dict[str, float], int]:
     model.train()
+    if args.freeze_bn:
+        set_batchnorm_eval(model)
     losses = []
     valid_corner_ratios = []
     use_amp = args.amp and device.type == "cuda"
+    accumulation_steps = max(1, int(args.gradient_accumulation_steps))
+    optimizer.zero_grad(set_to_none=True)
 
     for step, batch in enumerate(loader, start=1):
         batch = move_to_device(batch, device)
-        optimizer.zero_grad(set_to_none=True)
         with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
             logits = model(batch["image"])
-            loss_parts = corner_loss(logits, batch["heatmap"])
+            loss_parts = compute_loss(logits, batch, args)
             loss = loss_parts["loss"]
 
-        scaler.scale(loss).backward()
-        scaler.step(optimizer)
-        scaler.update()
+        scaler.scale(loss / accumulation_steps).backward()
+        if step % accumulation_steps == 0 or step == len(loader):
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad(set_to_none=True)
         losses.append(float(loss.item()))
         valid_ratio = float(batch["corner_valid"].float().mean().item())
         valid_corner_ratios.append(valid_ratio)
@@ -126,12 +145,13 @@ def evaluate(model: nn.Module, loader: Optional[DataLoader], device: torch.devic
     for batch in loader:
         batch = move_to_device(batch, device)
         logits = model(batch["image"])
-        loss_parts = corner_loss(logits, batch["heatmap"])
+        loss_parts = compute_loss(logits, batch, args)
         metrics = corner_metrics(
             logits,
             batch["corners_2d_crop"],
             batch["corner_valid"],
             crop_size=args.crop_size,
+            crop_hw=batch.get("crop_hw") if args.input_mode == INPUT_MODE_RECT_DYNAMIC else None,
             decode_method=args.decode_method,
             subpixel_window=args.subpixel_window,
             invisible_peak_threshold=args.invisible_peak_threshold,
@@ -179,19 +199,22 @@ def main() -> None:
     args.val_index = args.val_index or (args.data_root / "val.json")
     device = torch.device(args.device)
 
-    train_loader = make_loader(args.train_index, args.data_root, args.batch_size, args.num_workers, shuffle=True)
+    train_dataset = BOPCornerDataset(args.train_index, dataset_root=args.data_root, input_mode=args.input_mode, heatmap_sigma=args.sigma)
+    args.input_mode = train_dataset.input_mode if args.input_mode == "auto" else args.input_mode
+    if args.gradient_accumulation_steps is None:
+        args.gradient_accumulation_steps = 32 if args.input_mode == INPUT_MODE_RECT_DYNAMIC else 1
+    if args.freeze_bn is None:
+        args.freeze_bn = args.input_mode == INPUT_MODE_RECT_DYNAMIC
+    if args.input_mode == INPUT_MODE_RECT_DYNAMIC and args.batch_size != 1:
+        print("rect_dynamic uses strict variable-size tensors; forcing physical batch_size=1.")
+        args.batch_size = 1
+
+    train_loader = make_loader(train_dataset, args.batch_size, args.num_workers, shuffle=True, device=device)
     val_loader = None
     if args.val_index.exists():
-        val_dataset = BOPCornerDataset(args.val_index, dataset_root=args.data_root)
+        val_dataset = BOPCornerDataset(args.val_index, dataset_root=args.data_root, input_mode=args.input_mode, heatmap_sigma=args.sigma)
         if len(val_dataset) > 0:
-            val_loader = DataLoader(
-                val_dataset,
-                batch_size=args.batch_size,
-                shuffle=False,
-                num_workers=args.num_workers,
-                pin_memory=True,
-                collate_fn=collate_corner_batch,
-            )
+            val_loader = make_loader(val_dataset, args.batch_size, args.num_workers, shuffle=False, device=device)
 
     from src.mynet.model import CornerResNet34
 

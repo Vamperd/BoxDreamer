@@ -26,6 +26,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--line-width", type=int, default=2)
     parser.add_argument("--save-txt", action="store_true")
     parser.add_argument("--save-conf", action="store_true")
+    parser.add_argument("--save-crops", action="store_true", help="Save the original-sized bounding box crops.")
     return parser.parse_args()
 
 
@@ -176,6 +177,20 @@ def process_image(cv2: Any, model: Any, image_path: Path, out_dir: Path, lookup:
     overlay = draw_detections(cv2, frame, detections, args.line_width)
     output_path = out_dir / f"{image_path.stem}_pred{image_path.suffix}"
     cv2.imwrite(str(output_path), overlay)
+    
+    if args.save_crops:
+        crops_dir = out_dir / "crops"
+        crops_dir.mkdir(parents=True, exist_ok=True)
+        for det in detections:
+            bbox = det.get("bbox") or det.get("bbox_xyxy_full")
+            if bbox:
+                x1, y1, x2, y2 = [int(v) for v in bbox]
+                x1, y1 = max(0, x1), max(0, y1)
+                x2, y2 = min(width, x2), min(height, y2)
+                if x2 > x1 and y2 > y1:
+                    crop = frame[y1:y2, x1:x2]
+                    cv2.imwrite(str(crops_dir / f"{image_path.stem}_inst_{det.get('instance_id', 0)}.jpg"), crop)
+                    
     if args.save_txt:
         save_label_file(out_dir / "labels" / f"{image_path.stem}.txt", detections, width, height, args.save_conf)
     return {"image": str(image_path), "output": str(output_path), "detections": detections}
@@ -198,6 +213,10 @@ def process_video(cv2: Any, model: Any, video_path: Path, out_dir: Path, lookup:
     frame_records = []
     frame_idx = 0
     labels_dir = out_dir / "labels"
+    crops_dir = out_dir / "crops"
+    if args.save_crops:
+        crops_dir.mkdir(parents=True, exist_ok=True)
+        
     while True:
         ok, frame = cap.read()
         if not ok:
@@ -205,6 +224,19 @@ def process_video(cv2: Any, model: Any, video_path: Path, out_dir: Path, lookup:
         detections = detect_frame(model, frame, args)
         detections = maybe_apply_fallback(detections, lookup, args, frame_idx=frame_idx, image_path=None)
         writer.write(draw_detections(cv2, frame, detections, args.line_width))
+        
+        if args.save_crops:
+            for det in detections:
+                # Fallback to "bbox_xyxy_full" if "bbox" is missing (result_to_detections output)
+                bbox = det.get("bbox") or det.get("bbox_xyxy_full")
+                if bbox:
+                    x1, y1, x2, y2 = [int(v) for v in bbox]
+                    x1, y1 = max(0, x1), max(0, y1)
+                    x2, y2 = min(width, x2), min(height, y2)
+                    if x2 > x1 and y2 > y1:
+                        crop = frame[y1:y2, x1:x2]
+                        cv2.imwrite(str(crops_dir / f"frame_{frame_idx:06d}_inst_{det.get('instance_id', 0)}.jpg"), crop)
+
         if args.save_txt:
             save_label_file(labels_dir / f"frame_{frame_idx:06d}.txt", detections, width, height, args.save_conf)
         frame_records.append({"frame_idx": frame_idx, "detections": detections})

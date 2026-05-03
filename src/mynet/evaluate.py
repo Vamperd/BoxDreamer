@@ -8,7 +8,7 @@ from typing import Dict, Iterable
 import torch
 from torch.utils.data import DataLoader
 
-from src.mynet.dataset import BOPCornerDataset, collate_corner_batch
+from src.mynet.dataset import BOPCornerDataset, INPUT_MODE_RECT_DYNAMIC, collate_corner_batch
 from src.mynet.decode import corner_metrics
 from src.mynet.infer_image import load_model
 from src.mynet.losses import corner_loss
@@ -21,7 +21,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--num-workers", type=int, default=8)
+    parser.add_argument("--input-mode", choices=["auto", "fixed", "rect_dynamic"], default="auto")
     parser.add_argument("--crop-size", type=int, default=256)
+    parser.add_argument("--sigma", type=float, default=2.0)
     parser.add_argument("--decode-method", choices=["argmax", "subpixel"], default="subpixel")
     parser.add_argument("--subpixel-window", type=int, default=5)
     parser.add_argument("--invisible-peak-threshold", type=float, default=0.3)
@@ -55,7 +57,13 @@ def evaluate(args: argparse.Namespace) -> Dict[str, object]:
         raise FileNotFoundError(f"Checkpoint not found: {args.checkpoint}")
 
     device = torch.device(args.device)
-    dataset = BOPCornerDataset(args.val_index, dataset_root=args.data_root)
+    model = load_model(args.checkpoint, device)
+    if args.input_mode == "auto":
+        args.input_mode = getattr(model, "input_mode", "fixed")
+    if args.input_mode == INPUT_MODE_RECT_DYNAMIC and args.batch_size != 1:
+        args.batch_size = 1
+
+    dataset = BOPCornerDataset(args.val_index, dataset_root=args.data_root, input_mode=args.input_mode, heatmap_sigma=args.sigma)
     loader = DataLoader(
         dataset,
         batch_size=args.batch_size,
@@ -64,7 +72,6 @@ def evaluate(args: argparse.Namespace) -> Dict[str, object]:
         pin_memory=device.type == "cuda",
         collate_fn=collate_corner_batch,
     )
-    model = load_model(args.checkpoint, device)
     model.eval()
 
     records = []
@@ -73,12 +80,14 @@ def evaluate(args: argparse.Namespace) -> Dict[str, object]:
         batch = move_to_device(batch, device)
         with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
             logits = model(batch["image"])
-            loss_parts = corner_loss(logits, batch["heatmap"])
+            corner_valid = batch["corner_valid"] if args.input_mode == INPUT_MODE_RECT_DYNAMIC else None
+            loss_parts = corner_loss(logits, batch["heatmap"], corner_valid=corner_valid)
         metrics = corner_metrics(
             logits,
             batch["corners_2d_crop"],
             batch["corner_valid"],
             crop_size=args.crop_size,
+            crop_hw=batch.get("crop_hw") if args.input_mode == INPUT_MODE_RECT_DYNAMIC else None,
             decode_method=args.decode_method,
             subpixel_window=args.subpixel_window,
             invisible_peak_threshold=args.invisible_peak_threshold,
@@ -92,6 +101,7 @@ def evaluate(args: argparse.Namespace) -> Dict[str, object]:
         "data_root": str(args.data_root),
         "val_index": str(args.val_index),
         "samples": len(dataset),
+        "input_mode": args.input_mode,
         "crop_size": args.crop_size,
         "decode_method": args.decode_method,
         "subpixel_window": args.subpixel_window,

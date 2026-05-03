@@ -1,16 +1,49 @@
 from __future__ import annotations
 
-from typing import Dict
+from typing import Dict, Optional
 
 import torch
 
 
-def decode_heatmap_argmax(logits: torch.Tensor, crop_size: int = 256) -> torch.Tensor:
+def _crop_hw_tensor(
+    logits: torch.Tensor,
+    crop_size: int = 256,
+    crop_hw: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    bsz = logits.shape[0]
+    if crop_hw is None:
+        return torch.full((bsz, 2), float(crop_size), device=logits.device, dtype=logits.dtype)
+    crop_hw = crop_hw.to(device=logits.device, dtype=logits.dtype)
+    if crop_hw.ndim == 1:
+        crop_hw = crop_hw.view(1, 2).expand(bsz, 2)
+    if crop_hw.shape != (bsz, 2):
+        raise ValueError(f"crop_hw must be [B, 2] as [height, width], got {tuple(crop_hw.shape)}")
+    return crop_hw
+
+
+def _heatmap_to_crop_scale(
+    logits: torch.Tensor,
+    crop_size: int = 256,
+    crop_hw: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    _, _, height, width = logits.shape
+    crop_hw = _crop_hw_tensor(logits, crop_size=crop_size, crop_hw=crop_hw)
+    crop_h = crop_hw[:, 0].clamp_min(1.0)
+    crop_w = crop_hw[:, 1].clamp_min(1.0)
+    return torch.stack([crop_w / float(width), crop_h / float(height)], dim=-1).view(-1, 1, 2)
+
+
+def decode_heatmap_argmax(
+    logits: torch.Tensor,
+    crop_size: int = 256,
+    crop_hw: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
     """Decode heatmap logits into crop-space corner coordinates.
 
     Args:
         logits: [B, 8, H, W]
-        crop_size: crop image size in pixels.
+        crop_size: fixed square crop size in pixels.
+        crop_hw: optional dynamic crop size tensor [B, 2] as [height, width].
 
     Returns:
         Tensor [B, 8, 2] in crop pixel coordinates.
@@ -22,11 +55,16 @@ def decode_heatmap_argmax(logits: torch.Tensor, crop_size: int = 256) -> torch.T
     xs = (idx % width).float()
     ys = (idx // width).float()
     coords = torch.stack([xs, ys], dim=-1)
-    scale = torch.tensor([crop_size / width, crop_size / height], device=logits.device, dtype=logits.dtype)
+    scale = _heatmap_to_crop_scale(logits, crop_size=crop_size, crop_hw=crop_hw)
     return coords * scale
 
 
-def decode_heatmap_subpixel(logits: torch.Tensor, crop_size: int = 256, window: int = 5) -> torch.Tensor:
+def decode_heatmap_subpixel(
+    logits: torch.Tensor,
+    crop_size: int = 256,
+    crop_hw: Optional[torch.Tensor] = None,
+    window: int = 5,
+) -> torch.Tensor:
     """Decode heatmaps with a local weighted centroid around the argmax peak.
 
     The coordinate convention intentionally matches the existing dataset
@@ -67,20 +105,21 @@ def decode_heatmap_subpixel(logits: torch.Tensor, crop_size: int = 256, window: 
             coords[batch_idx, channel_idx, 0] = (patch * xx).sum() / denom
             coords[batch_idx, channel_idx, 1] = (patch * yy).sum() / denom
 
-    scale = torch.tensor([crop_size / width, crop_size / height], device=logits.device, dtype=probs.dtype)
+    scale = _heatmap_to_crop_scale(logits, crop_size=crop_size, crop_hw=crop_hw).to(dtype=probs.dtype)
     return coords * scale
 
 
 def decode_heatmap(
     logits: torch.Tensor,
     crop_size: int = 256,
+    crop_hw: Optional[torch.Tensor] = None,
     decode_method: str = "subpixel",
     subpixel_window: int = 5,
 ) -> torch.Tensor:
     if decode_method == "argmax":
-        return decode_heatmap_argmax(logits, crop_size=crop_size)
+        return decode_heatmap_argmax(logits, crop_size=crop_size, crop_hw=crop_hw)
     if decode_method == "subpixel":
-        return decode_heatmap_subpixel(logits, crop_size=crop_size, window=subpixel_window)
+        return decode_heatmap_subpixel(logits, crop_size=crop_size, crop_hw=crop_hw, window=subpixel_window)
     raise ValueError(f"Unsupported decode method: {decode_method}")
 
 
@@ -90,11 +129,12 @@ def corner_metrics(
     target_corners: torch.Tensor,
     valid: torch.Tensor,
     crop_size: int = 256,
+    crop_hw: Optional[torch.Tensor] = None,
     decode_method: str = "subpixel",
     subpixel_window: int = 5,
     invisible_peak_threshold: float = 0.3,
 ) -> Dict[str, float]:
-    pred = decode_heatmap(logits, crop_size=crop_size, decode_method=decode_method, subpixel_window=subpixel_window)
+    pred = decode_heatmap(logits, crop_size=crop_size, crop_hw=crop_hw, decode_method=decode_method, subpixel_window=subpixel_window)
     mask = valid.bool()
     probs = torch.sigmoid(logits.float())
     peak_scores = probs.flatten(2).max(dim=2).values
