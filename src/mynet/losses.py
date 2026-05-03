@@ -10,12 +10,17 @@ def heatmap_mse(logits: torch.Tensor, target: torch.Tensor, valid: Optional[torc
     pred = torch.sigmoid(logits.float())
     loss = (pred - target.float()) ** 2
     if valid is None:
-        return loss.mean()
+        return loss.flatten(1).mean(dim=1).mean()
 
     channel_mask = valid.bool().view(valid.shape[0], valid.shape[1], 1, 1)
-    if not bool(channel_mask.any()):
+    valid_channels = channel_mask.sum(dim=(1, 2, 3)).float()
+    valid_samples = valid_channels > 0
+    if not bool(valid_samples.any()):
         return loss.sum() * 0.0
-    return (loss * channel_mask).sum() / (channel_mask.sum() * logits.shape[-2] * logits.shape[-1]).clamp_min(1)
+
+    per_sample_loss = (loss * channel_mask).sum(dim=(1, 2, 3))
+    per_sample_denom = (valid_channels * logits.shape[-2] * logits.shape[-1]).clamp_min(1.0)
+    return (per_sample_loss / per_sample_denom)[valid_samples].mean()
 
 
 def corner_loss(

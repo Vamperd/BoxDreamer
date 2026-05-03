@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
+from torch.nn import functional as F
 from PIL import Image
 from torch.utils.data import Dataset
 
@@ -20,6 +21,9 @@ INPUT_MODES = {INPUT_MODE_FIXED, INPUT_MODE_RECT_DYNAMIC}
 SCALE_AUG_NONE = "none"
 SCALE_AUG_REAL_VIDEO_COVERAGE = "real_video_coverage"
 SCALE_AUG_MODES = {SCALE_AUG_NONE, SCALE_AUG_REAL_VIDEO_COVERAGE}
+RECT_BATCH_MODE_STRICT = "strict"
+RECT_BATCH_MODE_ASPECT_BUCKET = "aspect_bucket"
+RECT_BATCH_MODES = {RECT_BATCH_MODE_STRICT, RECT_BATCH_MODE_ASPECT_BUCKET}
 
 BBox = Tuple[float, float, float, float]
 
@@ -119,7 +123,7 @@ class BOPCornerDataset(Dataset):
         normalize: bool = True,
         input_mode: str = "auto",
         heatmap_sigma: float = 2.0,
-        scale_aug_mode: str = SCALE_AUG_REAL_VIDEO_COVERAGE,
+        scale_aug_mode: str = SCALE_AUG_NONE,
         scale_long_edge_min: int = 320,
         scale_long_edge_max: int = 768,
         scale_short_edge_min: int = 180,
@@ -197,14 +201,6 @@ class BOPCornerDataset(Dataset):
         corners_full = np.asarray(sample["corners_2d_full"], dtype=np.float32)
         corners_crop = full_to_rect_crop(corners_full, crop_box)
         original_crop_hw = (crop_h, crop_w)
-        scale_factor = self._sample_scale_factor(crop_w, crop_h)
-        if abs(scale_factor - 1.0) > 1e-6:
-            new_w = max(1, int(round(crop_w * scale_factor)))
-            new_h = max(1, int(round(crop_h * scale_factor)))
-            crop = crop.resize((new_w, new_h), Image.Resampling.BILINEAR)
-            corners_crop[:, 0] *= new_w / float(crop_w)
-            corners_crop[:, 1] *= new_h / float(crop_h)
-            crop_w, crop_h = crop.size
 
         image_np = np.asarray(crop, dtype=np.float32) / 255.0
         image = torch.from_numpy(image_np).permute(2, 0, 1).contiguous()
@@ -222,7 +218,8 @@ class BOPCornerDataset(Dataset):
             "crop_box_xyxy_full": torch.tensor(crop_box, dtype=torch.float32),
             "crop_hw": torch.tensor([crop_h, crop_w], dtype=torch.float32),
             "original_crop_hw": torch.tensor(original_crop_hw, dtype=torch.float32),
-            "scale_factor": torch.tensor(scale_factor, dtype=torch.float32),
+            "scale_factor": torch.tensor(1.0, dtype=torch.float32),
+            "scale_xy": torch.tensor([1.0, 1.0], dtype=torch.float32),
             "K": torch.tensor(sample["K"], dtype=torch.float32),
             "R": torch.tensor(sample["R"], dtype=torch.float32),
             "t": torch.tensor(sample["t"], dtype=torch.float32),
@@ -230,24 +227,99 @@ class BOPCornerDataset(Dataset):
             "input_mode": INPUT_MODE_RECT_DYNAMIC,
         }
 
-    def _sample_scale_factor(self, crop_w: int, crop_h: int) -> float:
-        if self.scale_aug_mode == SCALE_AUG_NONE:
-            return 1.0
-        long_edge = float(max(crop_w, crop_h))
-        short_edge = float(min(crop_w, crop_h))
-        if long_edge <= 0 or short_edge <= 0:
-            return 1.0
+def choose_rect_batch_target_hw(
+    batch: List[Dict[str, Any]],
+    *,
+    scale_aug_mode: str,
+    scale_long_edge_min: int,
+    scale_long_edge_max: int,
+    scale_short_edge_min: int,
+) -> Tuple[int, int]:
+    crop_hws = [item["crop_hw"].tolist() for item in batch]
+    ratios = sorted(float(crop_w) / float(max(1.0, crop_h)) for crop_h, crop_w in crop_hws)
+    ratio = ratios[len(ratios) // 2]
 
-        target_long = random.uniform(float(self.scale_long_edge_min), float(self.scale_long_edge_max))
-        scale = target_long / long_edge
-        if short_edge * scale < self.scale_short_edge_min:
-            scale = float(self.scale_short_edge_min) / short_edge
-        if long_edge * scale > self.scale_long_edge_max:
-            scale = float(self.scale_long_edge_max) / long_edge
-        return max(scale, 1e-6)
+    if scale_aug_mode == SCALE_AUG_REAL_VIDEO_COVERAGE:
+        target_long = random.uniform(float(scale_long_edge_min), float(scale_long_edge_max))
+    elif scale_aug_mode == SCALE_AUG_NONE:
+        target_long = max(max(float(crop_h), float(crop_w)) for crop_h, crop_w in crop_hws)
+    else:
+        raise ValueError(f"Unsupported scale augmentation mode: {scale_aug_mode}")
+
+    if ratio >= 1.0:
+        target_w = target_long
+        target_h = target_long / ratio
+    else:
+        target_h = target_long
+        target_w = target_long * ratio
+
+    short_edge = min(target_h, target_w)
+    if short_edge < scale_short_edge_min:
+        grow = float(scale_short_edge_min) / max(1.0, short_edge)
+        target_h *= grow
+        target_w *= grow
+
+    long_edge = max(target_h, target_w)
+    if long_edge > scale_long_edge_max:
+        shrink = float(scale_long_edge_max) / max(1.0, long_edge)
+        target_h *= shrink
+        target_w *= shrink
+
+    return max(1, int(round(target_h))), max(1, int(round(target_w)))
 
 
-def collate_corner_batch(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
+def resize_rect_dynamic_item(item: Dict[str, Any], target_hw: Tuple[int, int], *, heatmap_sigma: float) -> Dict[str, Any]:
+    target_h, target_w = target_hw
+    crop_h, crop_w = [float(v) for v in item["crop_hw"].tolist()]
+    scale_x = float(target_w) / max(1.0, crop_w)
+    scale_y = float(target_h) / max(1.0, crop_h)
+
+    resized = dict(item)
+    image = item["image"].unsqueeze(0)
+    resized["image"] = F.interpolate(image, size=(target_h, target_w), mode="bilinear", align_corners=False).squeeze(0).contiguous()
+
+    corners_crop = item["corners_2d_crop"].clone()
+    corners_crop[:, 0] *= scale_x
+    corners_crop[:, 1] *= scale_y
+    corner_visible = [int(v) for v in item["corner_valid"].tolist()]
+    heatmaps, corner_valid = make_dynamic_heatmaps(corners_crop.numpy(), corner_visible, (target_h, target_w), sigma=heatmap_sigma)
+
+    resized["heatmap"] = torch.from_numpy(heatmaps)
+    resized["corners_2d_crop"] = corners_crop
+    resized["corner_valid"] = torch.tensor(corner_valid, dtype=torch.bool)
+    resized["crop_hw"] = torch.tensor([target_h, target_w], dtype=torch.float32)
+    resized["scale_xy"] = torch.tensor([scale_x, scale_y], dtype=torch.float32)
+    resized["scale_factor"] = torch.tensor(math.sqrt(scale_x * scale_y), dtype=torch.float32)
+    return resized
+
+
+def collate_corner_batch(
+    batch: List[Dict[str, Any]],
+    *,
+    rect_batch_mode: str = RECT_BATCH_MODE_STRICT,
+    scale_aug_mode: str = SCALE_AUG_NONE,
+    scale_long_edge_min: int = 320,
+    scale_long_edge_max: int = 768,
+    scale_short_edge_min: int = 180,
+    heatmap_sigma: float = 2.0,
+) -> Dict[str, Any]:
+    if rect_batch_mode not in RECT_BATCH_MODES:
+        raise ValueError(f"Unsupported rect batch mode: {rect_batch_mode}")
+    if scale_aug_mode not in SCALE_AUG_MODES:
+        raise ValueError(f"Unsupported scale augmentation mode: {scale_aug_mode}")
+
+    input_modes = [item.get("input_mode", INPUT_MODE_FIXED) for item in batch]
+    is_rect_dynamic = any(mode == INPUT_MODE_RECT_DYNAMIC for mode in input_modes)
+    if is_rect_dynamic and rect_batch_mode == RECT_BATCH_MODE_ASPECT_BUCKET:
+        target_hw = choose_rect_batch_target_hw(
+            batch,
+            scale_aug_mode=scale_aug_mode,
+            scale_long_edge_min=scale_long_edge_min,
+            scale_long_edge_max=scale_long_edge_max,
+            scale_short_edge_min=scale_short_edge_min,
+        )
+        batch = [resize_rect_dynamic_item(item, target_hw, heatmap_sigma=heatmap_sigma) for item in batch]
+
     tensor_keys = [
         "image",
         "heatmap",
@@ -264,6 +336,8 @@ def collate_corner_batch(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         tensor_keys.append("original_crop_hw")
     if "scale_factor" in batch[0]:
         tensor_keys.append("scale_factor")
+    if "scale_xy" in batch[0]:
+        tensor_keys.append("scale_xy")
     if len(batch) > 1:
         image_shapes = {tuple(item["image"].shape) for item in batch}
         heatmap_shapes = {tuple(item["heatmap"].shape) for item in batch}
