@@ -9,7 +9,7 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader
 
-from src.mynet.dataset import BOPCornerDataset, INPUT_MODE_RECT_DYNAMIC, collate_corner_batch
+from src.mynet.dataset import BOPCornerDataset, INPUT_MODE_RECT_DYNAMIC, SCALE_AUG_NONE, SCALE_AUG_REAL_VIDEO_COVERAGE, collate_corner_batch
 from src.mynet.decode import corner_metrics
 from src.mynet.losses import corner_loss
 
@@ -28,6 +28,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--input-mode", choices=["auto", "fixed", "rect_dynamic"], default="auto")
     parser.add_argument("--crop-size", type=int, default=256)
     parser.add_argument("--sigma", type=float, default=2.0)
+    parser.add_argument("--scale-aug-mode", choices=[SCALE_AUG_NONE, SCALE_AUG_REAL_VIDEO_COVERAGE], default=SCALE_AUG_REAL_VIDEO_COVERAGE)
+    parser.add_argument("--scale-long-edge-min", type=int, default=320)
+    parser.add_argument("--scale-long-edge-max", type=int, default=768)
+    parser.add_argument("--scale-short-edge-min", type=int, default=180)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=None)
     parser.add_argument("--decode-method", choices=["argmax", "subpixel"], default="subpixel")
     parser.add_argument("--subpixel-window", type=int, default=5)
@@ -199,7 +203,16 @@ def main() -> None:
     args.val_index = args.val_index or (args.data_root / "val.json")
     device = torch.device(args.device)
 
-    train_dataset = BOPCornerDataset(args.train_index, dataset_root=args.data_root, input_mode=args.input_mode, heatmap_sigma=args.sigma)
+    train_dataset = BOPCornerDataset(
+        args.train_index,
+        dataset_root=args.data_root,
+        input_mode=args.input_mode,
+        heatmap_sigma=args.sigma,
+        scale_aug_mode=args.scale_aug_mode,
+        scale_long_edge_min=args.scale_long_edge_min,
+        scale_long_edge_max=args.scale_long_edge_max,
+        scale_short_edge_min=args.scale_short_edge_min,
+    )
     args.input_mode = train_dataset.input_mode if args.input_mode == "auto" else args.input_mode
     if args.gradient_accumulation_steps is None:
         args.gradient_accumulation_steps = 32 if args.input_mode == INPUT_MODE_RECT_DYNAMIC else 1
@@ -212,7 +225,13 @@ def main() -> None:
     train_loader = make_loader(train_dataset, args.batch_size, args.num_workers, shuffle=True, device=device)
     val_loader = None
     if args.val_index.exists():
-        val_dataset = BOPCornerDataset(args.val_index, dataset_root=args.data_root, input_mode=args.input_mode, heatmap_sigma=args.sigma)
+        val_dataset = BOPCornerDataset(
+            args.val_index,
+            dataset_root=args.data_root,
+            input_mode=args.input_mode,
+            heatmap_sigma=args.sigma,
+            scale_aug_mode=SCALE_AUG_NONE,
+        )
         if len(val_dataset) > 0:
             val_loader = make_loader(val_dataset, args.batch_size, args.num_workers, shuffle=False, device=device)
 

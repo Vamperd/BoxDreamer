@@ -8,7 +8,7 @@ from typing import Dict, Iterable
 import torch
 from torch.utils.data import DataLoader
 
-from src.mynet.dataset import BOPCornerDataset, INPUT_MODE_RECT_DYNAMIC, collate_corner_batch
+from src.mynet.dataset import BOPCornerDataset, INPUT_MODE_RECT_DYNAMIC, SCALE_AUG_NONE, collate_corner_batch
 from src.mynet.decode import corner_metrics
 from src.mynet.infer_image import load_model
 from src.mynet.losses import corner_loss
@@ -63,7 +63,7 @@ def evaluate(args: argparse.Namespace) -> Dict[str, object]:
     if args.input_mode == INPUT_MODE_RECT_DYNAMIC and args.batch_size != 1:
         args.batch_size = 1
 
-    dataset = BOPCornerDataset(args.val_index, dataset_root=args.data_root, input_mode=args.input_mode, heatmap_sigma=args.sigma)
+    dataset = BOPCornerDataset(args.val_index, dataset_root=args.data_root, input_mode=args.input_mode, heatmap_sigma=args.sigma, scale_aug_mode=SCALE_AUG_NONE)
     loader = DataLoader(
         dataset,
         batch_size=args.batch_size,

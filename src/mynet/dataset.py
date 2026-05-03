@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import random
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -16,6 +17,9 @@ IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(3, 
 INPUT_MODE_FIXED = "fixed"
 INPUT_MODE_RECT_DYNAMIC = "rect_dynamic"
 INPUT_MODES = {INPUT_MODE_FIXED, INPUT_MODE_RECT_DYNAMIC}
+SCALE_AUG_NONE = "none"
+SCALE_AUG_REAL_VIDEO_COVERAGE = "real_video_coverage"
+SCALE_AUG_MODES = {SCALE_AUG_NONE, SCALE_AUG_REAL_VIDEO_COVERAGE}
 
 BBox = Tuple[float, float, float, float]
 
@@ -115,18 +119,32 @@ class BOPCornerDataset(Dataset):
         normalize: bool = True,
         input_mode: str = "auto",
         heatmap_sigma: float = 2.0,
+        scale_aug_mode: str = SCALE_AUG_REAL_VIDEO_COVERAGE,
+        scale_long_edge_min: int = 320,
+        scale_long_edge_max: int = 768,
+        scale_short_edge_min: int = 180,
     ) -> None:
         self.index_path = Path(index_path)
         self.dataset_root = Path(dataset_root) if dataset_root is not None else None
         self.samples: List[Dict[str, Any]] = _load_json(self.index_path)
         self.normalize = normalize
         self.heatmap_sigma = heatmap_sigma
+        self.scale_aug_mode = scale_aug_mode
+        self.scale_long_edge_min = scale_long_edge_min
+        self.scale_long_edge_max = scale_long_edge_max
+        self.scale_short_edge_min = scale_short_edge_min
 
         if not isinstance(self.samples, list):
             raise ValueError(f"Index must contain a list of samples: {self.index_path}")
         self.input_mode = infer_input_mode(self.samples) if input_mode == "auto" else input_mode
         if self.input_mode not in INPUT_MODES:
             raise ValueError(f"Unsupported input mode: {self.input_mode}")
+        if self.scale_aug_mode not in SCALE_AUG_MODES:
+            raise ValueError(f"Unsupported scale augmentation mode: {self.scale_aug_mode}")
+        if self.scale_long_edge_min <= 0 or self.scale_long_edge_max <= 0 or self.scale_short_edge_min <= 0:
+            raise ValueError("Scale augmentation edge limits must be positive.")
+        if self.scale_long_edge_max < self.scale_long_edge_min:
+            raise ValueError("scale_long_edge_max must be >= scale_long_edge_min.")
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -175,13 +193,24 @@ class BOPCornerDataset(Dataset):
         left, top, right, bottom = [int(v) for v in crop_box]
         crop = image_full.crop((left, top, right, bottom))
         crop_w, crop_h = crop.size
+
+        corners_full = np.asarray(sample["corners_2d_full"], dtype=np.float32)
+        corners_crop = full_to_rect_crop(corners_full, crop_box)
+        original_crop_hw = (crop_h, crop_w)
+        scale_factor = self._sample_scale_factor(crop_w, crop_h)
+        if abs(scale_factor - 1.0) > 1e-6:
+            new_w = max(1, int(round(crop_w * scale_factor)))
+            new_h = max(1, int(round(crop_h * scale_factor)))
+            crop = crop.resize((new_w, new_h), Image.Resampling.BILINEAR)
+            corners_crop[:, 0] *= new_w / float(crop_w)
+            corners_crop[:, 1] *= new_h / float(crop_h)
+            crop_w, crop_h = crop.size
+
         image_np = np.asarray(crop, dtype=np.float32) / 255.0
         image = torch.from_numpy(image_np).permute(2, 0, 1).contiguous()
         if self.normalize:
             image = (image - IMAGENET_MEAN) / IMAGENET_STD
 
-        corners_full = np.asarray(sample["corners_2d_full"], dtype=np.float32)
-        corners_crop = full_to_rect_crop(corners_full, crop_box)
         corner_visible = [int(v) for v in sample.get("corner_visible", [1] * 8)]
         heatmaps, corner_valid = make_dynamic_heatmaps(corners_crop, corner_visible, (crop_h, crop_w), sigma=self.heatmap_sigma)
 
@@ -192,12 +221,30 @@ class BOPCornerDataset(Dataset):
             "corner_valid": torch.tensor(corner_valid, dtype=torch.bool),
             "crop_box_xyxy_full": torch.tensor(crop_box, dtype=torch.float32),
             "crop_hw": torch.tensor([crop_h, crop_w], dtype=torch.float32),
+            "original_crop_hw": torch.tensor(original_crop_hw, dtype=torch.float32),
+            "scale_factor": torch.tensor(scale_factor, dtype=torch.float32),
             "K": torch.tensor(sample["K"], dtype=torch.float32),
             "R": torch.tensor(sample["R"], dtype=torch.float32),
             "t": torch.tensor(sample["t"], dtype=torch.float32),
             "sample_id": sample["sample_id"],
             "input_mode": INPUT_MODE_RECT_DYNAMIC,
         }
+
+    def _sample_scale_factor(self, crop_w: int, crop_h: int) -> float:
+        if self.scale_aug_mode == SCALE_AUG_NONE:
+            return 1.0
+        long_edge = float(max(crop_w, crop_h))
+        short_edge = float(min(crop_w, crop_h))
+        if long_edge <= 0 or short_edge <= 0:
+            return 1.0
+
+        target_long = random.uniform(float(self.scale_long_edge_min), float(self.scale_long_edge_max))
+        scale = target_long / long_edge
+        if short_edge * scale < self.scale_short_edge_min:
+            scale = float(self.scale_short_edge_min) / short_edge
+        if long_edge * scale > self.scale_long_edge_max:
+            scale = float(self.scale_long_edge_max) / long_edge
+        return max(scale, 1e-6)
 
 
 def collate_corner_batch(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -213,6 +260,10 @@ def collate_corner_batch(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     ]
     if "crop_hw" in batch[0]:
         tensor_keys.append("crop_hw")
+    if "original_crop_hw" in batch[0]:
+        tensor_keys.append("original_crop_hw")
+    if "scale_factor" in batch[0]:
+        tensor_keys.append("scale_factor")
     if len(batch) > 1:
         image_shapes = {tuple(item["image"].shape) for item in batch}
         heatmap_shapes = {tuple(item["heatmap"].shape) for item in batch}
