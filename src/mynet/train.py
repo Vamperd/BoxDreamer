@@ -45,6 +45,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--scale-long-edge-min", type=int, default=320)
     parser.add_argument("--scale-long-edge-max", type=int, default=768)
     parser.add_argument("--scale-short-edge-min", type=int, default=180)
+    parser.add_argument("--val-scale-long-edge", type=int, default=None, help="If set, resize rect_dynamic validation crops to this fixed long edge.")
     parser.add_argument("--gradient-accumulation-steps", type=int, default=None)
     parser.add_argument("--decode-method", choices=["argmax", "subpixel"], default="subpixel")
     parser.add_argument("--subpixel-window", type=int, default=5)
@@ -426,6 +427,7 @@ def main() -> None:
             scale_aug_mode=SCALE_AUG_NONE,
         )
         if len(val_dataset) > 0:
+            val_resized = args.input_mode == INPUT_MODE_RECT_DYNAMIC and args.val_scale_long_edge is not None
             val_batch_size = 1 if args.input_mode == INPUT_MODE_RECT_DYNAMIC else args.batch_size
             val_loader = make_loader(
                 val_dataset,
@@ -433,8 +435,11 @@ def main() -> None:
                 args.num_workers,
                 shuffle=False,
                 device=device,
-                rect_batch_mode=RECT_BATCH_MODE_STRICT,
-                scale_aug_mode=SCALE_AUG_NONE,
+                rect_batch_mode=RECT_BATCH_MODE_ASPECT_BUCKET if val_resized else RECT_BATCH_MODE_STRICT,
+                scale_aug_mode=SCALE_AUG_REAL_VIDEO_COVERAGE if val_resized else SCALE_AUG_NONE,
+                scale_long_edge_min=args.val_scale_long_edge or args.scale_long_edge_min,
+                scale_long_edge_max=args.val_scale_long_edge or args.scale_long_edge_max,
+                scale_short_edge_min=args.scale_short_edge_min,
                 heatmap_sigma=args.sigma,
             )
 

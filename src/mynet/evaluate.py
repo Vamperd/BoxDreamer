@@ -2,13 +2,22 @@ from __future__ import annotations
 
 import argparse
 import json
+from functools import partial
 from pathlib import Path
 from typing import Dict, Iterable
 
 import torch
 from torch.utils.data import DataLoader
 
-from src.mynet.dataset import BOPCornerDataset, INPUT_MODE_RECT_DYNAMIC, SCALE_AUG_NONE, collate_corner_batch
+from src.mynet.dataset import (
+    BOPCornerDataset,
+    INPUT_MODE_RECT_DYNAMIC,
+    RECT_BATCH_MODE_ASPECT_BUCKET,
+    RECT_BATCH_MODE_STRICT,
+    SCALE_AUG_NONE,
+    SCALE_AUG_REAL_VIDEO_COVERAGE,
+    collate_corner_batch,
+)
 from src.mynet.decode import corner_metrics
 from src.mynet.infer_image import load_model
 from src.mynet.losses import corner_loss
@@ -24,6 +33,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--input-mode", choices=["auto", "fixed", "rect_dynamic"], default="auto")
     parser.add_argument("--crop-size", type=int, default=256)
     parser.add_argument("--sigma", type=float, default=2.0)
+    parser.add_argument("--val-scale-long-edge", type=int, default=None, help="If set, resize rect_dynamic validation crops to this fixed long edge.")
+    parser.add_argument("--scale-short-edge-min", type=int, default=180)
     parser.add_argument("--decode-method", choices=["argmax", "subpixel"], default="subpixel")
     parser.add_argument("--subpixel-window", type=int, default=5)
     parser.add_argument("--invisible-peak-threshold", type=float, default=0.3)
@@ -64,13 +75,23 @@ def evaluate(args: argparse.Namespace) -> Dict[str, object]:
         args.batch_size = 1
 
     dataset = BOPCornerDataset(args.val_index, dataset_root=args.data_root, input_mode=args.input_mode, heatmap_sigma=args.sigma, scale_aug_mode=SCALE_AUG_NONE)
+    val_resized = args.input_mode == INPUT_MODE_RECT_DYNAMIC and args.val_scale_long_edge is not None
+    collate_fn = partial(
+        collate_corner_batch,
+        rect_batch_mode=RECT_BATCH_MODE_ASPECT_BUCKET if val_resized else RECT_BATCH_MODE_STRICT,
+        scale_aug_mode=SCALE_AUG_REAL_VIDEO_COVERAGE if val_resized else SCALE_AUG_NONE,
+        scale_long_edge_min=args.val_scale_long_edge or 320,
+        scale_long_edge_max=args.val_scale_long_edge or 768,
+        scale_short_edge_min=args.scale_short_edge_min,
+        heatmap_sigma=args.sigma,
+    )
     loader = DataLoader(
         dataset,
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=args.num_workers,
         pin_memory=device.type == "cuda",
-        collate_fn=collate_corner_batch,
+        collate_fn=collate_fn,
     )
     model.eval()
 
@@ -102,6 +123,7 @@ def evaluate(args: argparse.Namespace) -> Dict[str, object]:
         "val_index": str(args.val_index),
         "samples": len(dataset),
         "input_mode": args.input_mode,
+        "val_scale_long_edge": args.val_scale_long_edge,
         "crop_size": args.crop_size,
         "decode_method": args.decode_method,
         "subpixel_window": args.subpixel_window,
