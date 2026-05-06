@@ -36,6 +36,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-records", type=int, default=None)
     parser.add_argument("--record-id", action="append", default=[], help="Only annotate matching record_id. Can be repeated.")
     parser.add_argument("--append-full-records", action="store_true", help="Append full records instead of upgrading bbox-only records in place.")
+    parser.add_argument("--export-mode", choices=["final", "batch", "each"], default="final", help="When to rebuild YOLO/MyNet exports during annotation.")
+    parser.add_argument("--export-every", type=int, default=20, help="Export every N completed records when --export-mode=batch.")
+    parser.add_argument("--export-only", action="store_true", help="Only rebuild YOLO/MyNet exports from annotations.json and exit.")
     return parser.parse_args()
 
 
@@ -171,6 +174,24 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--end-sec must be greater than --start-sec.")
     if args.max_records is not None and args.max_records <= 0:
         raise ValueError("--max-records must be positive.")
+    if args.export_every <= 0:
+        raise ValueError("--export-every must be positive.")
+
+
+def maybe_export(data: Dict[str, Any], args: argparse.Namespace, completed: int) -> None:
+    if args.export_mode == "each":
+        export_all(data, args.output_root, args)
+        print("Exported YOLO/MyNet data.")
+    elif args.export_mode == "batch" and completed > 0 and completed % args.export_every == 0:
+        export_all(data, args.output_root, args)
+        print(f"Exported YOLO/MyNet data after {completed} completed records.")
+
+
+def final_export(data: Dict[str, Any], args: argparse.Namespace) -> None:
+    if args.export_mode in {"final", "batch"}:
+        print("Exporting YOLO/MyNet data...")
+        export_all(data, args.output_root, args)
+        print("Export complete.")
 
 
 def main() -> None:
@@ -180,8 +201,15 @@ def main() -> None:
     if not args.annotations_json.exists():
         raise FileNotFoundError(f"annotations.json not found: {args.annotations_json}")
 
-    cv2 = load_cv2()
     data = load_json(args.annotations_json)
+    if args.export_only:
+        print("Exporting YOLO/MyNet data from annotations.json...")
+        export_all(data, args.output_root, args)
+        print(f"Updated MyNet data: {args.output_root / 'mynet'}")
+        print(f"Updated YOLO data: {args.output_root / 'yolo'}")
+        return
+
+    cv2 = load_cv2()
     frames: List[Dict[str, Any]] = data.get("frames", [])
     targets = [(idx, frame) for idx, frame in enumerate(frames) if should_visit(frame, args)]
     if args.max_records is not None:
@@ -194,7 +222,7 @@ def main() -> None:
         result, new_frame = annotate_record(cv2, data, frame, args)
         if result == "quit":
             save_json(args.annotations_json, data)
-            export_all(data, args.output_root, args)
+            final_export(data, args)
             print("Saved current progress. Quit requested.")
             return
         if result == "skip" or new_frame is None:
@@ -202,12 +230,12 @@ def main() -> None:
             continue
         replace_frame_record(data, index, new_frame, args.append_full_records)
         save_json(args.annotations_json, data)
-        export_all(data, args.output_root, args)
         completed += 1
+        maybe_export(data, args, completed)
         print(f"Saved record={new_frame.get('record_id')} as {new_frame.get('status')}.")
 
     save_json(args.annotations_json, data)
-    export_all(data, args.output_root, args)
+    final_export(data, args)
     cv2.destroyAllWindows()
     print(f"Done. Completed {completed}/{len(targets)} records.")
     print(f"Updated annotations: {args.annotations_json}")
