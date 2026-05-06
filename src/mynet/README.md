@@ -430,11 +430,14 @@ python -m src.mynet.train \
   --train-index data/dji_action4_video_annot/mynet/train.json \
   --val-index data/dji_action4_video_annot/mynet/val.json \
   --output-dir models/checkpoints/mynet_video_ft \
+  --init-checkpoint models/checkpoints/mynet_resnet34_tight001_photoaug/best.pt \
   --epochs 80 \
   --batch-size 32 \
   --lr 3e-5 \
   --amp
 ```
+
+`--init-checkpoint` 用于从已经训练好的 MyNet 权重开始微调；它只加载模型参数，不恢复 optimizer 和 epoch。
 
 脚本会读取已有 `annotations.json`。默认行为是追加新标注；若要从头开始，增加 `--overwrite`。
 

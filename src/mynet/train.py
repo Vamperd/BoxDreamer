@@ -20,6 +20,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train-index", type=Path, default=None)
     parser.add_argument("--val-index", type=Path, default=None)
     parser.add_argument("--output-dir", type=Path, default=Path("models/checkpoints/mynet_resnet34"))
+    parser.add_argument("--init-checkpoint", type=Path, default=None, help="Optional existing MyNet .pt checkpoint used to initialize model weights for fine-tuning.")
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--num-workers", type=int, default=8)
@@ -173,6 +174,22 @@ def save_checkpoint(path: Path, model: nn.Module, optimizer: torch.optim.Optimiz
     )
 
 
+def load_init_checkpoint(path: Path, model: nn.Module, device: torch.device) -> None:
+    if not path.exists():
+        raise FileNotFoundError(f"Initial checkpoint not found: {path}")
+    checkpoint = torch.load(path, map_location=device)
+    state_dict = checkpoint["model"] if isinstance(checkpoint, dict) and "model" in checkpoint else checkpoint
+    if not isinstance(state_dict, dict):
+        raise ValueError(f"Checkpoint does not contain a model state_dict: {path}")
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    if missing or unexpected:
+        raise RuntimeError(
+            f"Could not strictly load initial checkpoint {path}. "
+            f"Missing keys: {list(missing)}. Unexpected keys: {list(unexpected)}."
+        )
+    print(f"Loaded initial checkpoint for fine-tuning: {path}")
+
+
 def make_summary_writer(args: argparse.Namespace) -> Optional[object]:
     if not args.tensorboard:
         return None
@@ -225,6 +242,8 @@ def main() -> None:
     from src.mynet.model import CornerResNet34
 
     model = CornerResNet34(out_channels=8, pretrained=args.pretrained).to(device)
+    if args.init_checkpoint is not None:
+        load_init_checkpoint(args.init_checkpoint, model, device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scaler = torch.cuda.amp.GradScaler(enabled=args.amp and device.type == "cuda")
 
