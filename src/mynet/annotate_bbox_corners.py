@@ -18,6 +18,7 @@ from src.mynet.annotate_video import (
     load_json,
     make_square_crop_box,
     save_json,
+    scale_image_for_display,
     wait_action,
 )
 
@@ -31,6 +32,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sigma", type=float, default=2.0)
     parser.add_argument("--bbox-padding", type=float, default=0.25)
     parser.add_argument("--max-display-side", type=int, default=1200)
+    parser.add_argument("--corner-display-side", type=int, default=768, help="Upscale ROI corner annotation window to this side length before display. Set 0 to disable upscaling.")
     parser.add_argument("--start-sec", type=float, default=None)
     parser.add_argument("--end-sec", type=float, default=None)
     parser.add_argument("--max-records", type=int, default=None)
@@ -118,7 +120,14 @@ def annotate_record(cv2: Any, data: Dict[str, Any], frame: Dict[str, Any], args:
         crop_bbox = (0.0, 0.0, float(args.crop_size), float(args.crop_size))
 
         while True:
-            result, corners_crop_list, valid = annotate_instance_corners(cv2, crop_bgr, crop_bbox, inst_idx, args.max_display_side)
+            result, corners_crop_list, valid = annotate_instance_corners(
+                cv2,
+                crop_bgr,
+                crop_bbox,
+                inst_idx,
+                args.max_display_side,
+                min_display_side=args.corner_display_side,
+            )
             if result in {"quit", "skip"}:
                 return result, None
             if corners_crop_list is None or valid is None:
@@ -129,6 +138,7 @@ def annotate_record(cv2: Any, data: Dict[str, Any], frame: Dict[str, Any], args:
             inst["corner_valid"] = [int(v) for v in valid]
 
             preview = draw_full_preview(cv2, image_bgr, [tuple(float(v) for v in item["bbox_xyxy_full"]) for item in instances], instances)
+            preview, _ = scale_image_for_display(cv2, preview, args.max_display_side)
             action = wait_action(
                 cv2,
                 preview,
@@ -168,6 +178,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--crop-size and --heatmap-size must be positive.")
     if args.bbox_padding < 0:
         raise ValueError("--bbox-padding must be >= 0.")
+    if args.corner_display_side < 0:
+        raise ValueError("--corner-display-side must be >= 0.")
     if args.start_sec is not None and args.start_sec < 0:
         raise ValueError("--start-sec must be >= 0.")
     if args.end_sec is not None and args.start_sec is not None and args.end_sec <= args.start_sec:

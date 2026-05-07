@@ -97,13 +97,19 @@ def load_json(path: Path) -> Any:
         return json.load(f)
 
 
-def scale_image_for_display(cv2: Any, image: np.ndarray, max_side: int) -> tuple[np.ndarray, float]:
+def scale_image_for_display(cv2: Any, image: np.ndarray, max_side: int, min_side: int = 0) -> tuple[np.ndarray, float]:
     height, width = image.shape[:2]
     side = max(height, width)
-    if side <= max_side:
+    target_side = float(side)
+    if min_side > 0 and side < min_side:
+        target_side = float(min_side)
+    if max_side > 0 and target_side > max_side:
+        target_side = float(max_side)
+    if abs(target_side - float(side)) < 1e-6:
         return image.copy(), 1.0
-    scale = max_side / float(side)
-    display = cv2.resize(image, (int(round(width * scale)), int(round(height * scale))), interpolation=cv2.INTER_AREA)
+    scale = target_side / float(side)
+    interpolation = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
+    display = cv2.resize(image, (int(round(width * scale)), int(round(height * scale))), interpolation=interpolation)
     return display, scale
 
 
@@ -238,8 +244,9 @@ def annotate_instance_corners(
     bbox: BBox,
     instance_idx: int,
     max_display_side: int,
+    min_display_side: int = 0,
 ) -> tuple[str, Optional[List[List[float]]], Optional[List[int]]]:
-    display, scale = scale_image_for_display(cv2, image, max_display_side)
+    display, scale = scale_image_for_display(cv2, image, max_display_side, min_side=min_display_side)
     corners: List[Optional[List[float]]] = [None] * 8
     valid: List[int] = [0] * 8
     current_idx = 0
@@ -258,7 +265,7 @@ def annotate_instance_corners(
         current_idx += 1
         redraw()
 
-    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    cv2.namedWindow(window_name, cv2.WINDOW_AUTOSIZE)
     cv2.setMouseCallback(window_name, on_mouse)
     redraw()
 
